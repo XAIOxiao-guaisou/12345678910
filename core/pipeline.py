@@ -1,0 +1,183 @@
+import asyncio
+import logging
+from core.services.llm_service.deepseek_service import DeepSeekService
+from core.services.db_service.feishu_bitable import FeishuBitableManager
+import time
+import os
+import aiohttp
+
+logger = logging.getLogger(__name__)
+
+class PipelineOrchestrator:
+    def __init__(self):
+        self.bitable = FeishuBitableManager()
+
+    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime"):
+        logger.info(f"======== 开始小说全自动上云飞书 (DeepSeek, Style: {style_key}) ========")
+        
+        # 1. 彻底清空四张表
+        logger.info("清理历史积累表数据...")
+        self.bitable.purge_all_records()
+        self.bitable.purge_factory_records()
+        self.bitable.purge_assets_records()
+        self.bitable.purge_memory_records()
+        
+        # 2. 阶段一：记忆灌注与空间构建 (建档)
+        logger.info("进入两阶段架构：阶段一 (构建记忆中枢)...")
+        try:
+            memory_data = DeepSeekService.generate_memory_context(novel_text)
+            logger.info(f"✅ 记忆中枢提取完毕，获得 {len(memory_data)} 条设定。")
+            self.bitable.insert_memory_records(memory_data)
+        except Exception as e:
+            logger.error(f"❌ 阶段一严重错误: {e}")
+            return {"status": "error", "message": str(e)}
+
+        # Fetch all memories (simulate real decoupling)
+        all_memories = self.bitable.get_all_memories()
+
+        # 3. 阶段二：自主执导与分镜 (拆解)
+        chunks = DeepSeekService.smart_chunk_text(novel_text, 1000)
+        logger.info(f"📖 小说共 {len(novel_text)} 字，切分 {len(chunks)} 块执行拆解...")
+        all_scenes = []
+        
+        for idx, chunk in enumerate(chunks):
+            logger.info(f"🧠 [正在分析 {idx+1}/{len(chunks)} 块...]")
+            
+            # 关键词匹配机制：只提取当前 chunk_text 中出现过的记忆词条
+            relevant_memories = []
+            for mem in all_memories:
+                name = mem.get("name", "")
+                # 如果名字在文本中出现，或者是宏观的世界观/氛围设定（默认带入）
+                if name and name in chunk:
+                    relevant_memories.append(mem)
+                elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
+                    relevant_memories.append(mem)
+            
+            # 构建记忆文段
+            memory_context_str = "【全局世界观与当前段落相关的记忆词条】\n"
+            for rm in relevant_memories:
+                memory_context_str += f"- [{rm.get('category', '设定')}] {rm.get('name', '')}：{rm.get('lore', '')}\n  视觉隐喻：{rm.get('visual_aura', '')}\n"
+
+            scenes = DeepSeekService.generate_scenes_for_chunk(chunk, memory_context_str)
+            if scenes:
+                 all_scenes.extend(scenes)
+                 logger.info(f"✅ 第{idx+1}块完成，累积分镜: {len(all_scenes)} 个")
+            time.sleep(1)
+            
+        if not all_scenes:
+            logger.error("❌ 所有片段解析失败，退出。")
+            return {"status": "error", "message": "两阶段管线解析失败"}
+            
+        for idx, scene in enumerate(all_scenes):
+            scene["_episode"] = idx + 1
+            
+        # 4. 回填飞书
+        logger.info("云端写入剧本拆解（两阶段生成）...")
+        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1)
+
+        prompts = [scene.get("master_prompt", scene.get("visual_prompt", "")) for scene in all_scenes if scene.get("master_prompt") or scene.get("visual_prompt")]
+
+        logger.info("🎉 小说拆解上云已圆满结束，AI 自动化正在托管！")
+        return {
+            "status": "success",
+            "chunks": len(chunks),
+            "scenes": len(all_scenes),
+            "inserted": len(inserted_ids),
+            "prompts": prompts
+        }
+    
+    async def run_video_generation(self, account: str, prompts: list, gateway: str = "seedance-1.5-pro"):
+        """
+        Since we moved away from Playwright and to API-driven interfaces,
+        this will use the configured Model API backend based on 'gateway'.
+        """
+        logger.info(f"=== 开始 API 驱动视频生成流程 (Account: {account}, 模型: {gateway}) ===")
+        # Dynamically load the correct class
+        if "seedance" in gateway.lower() or "volcengine" in gateway.lower() or gateway == "API_MODE":
+            from core.services.video_service.volcengine_service import VolcengineVideoAPI
+            try:
+                # In real prod this key should be an env var
+                api_key = os.environ.get("VOLCENGINE_API_KEY", "693c67a0-2b84-4e7c-afcd-7a2fb8f0134c")
+                video_api = VolcengineVideoAPI(api_key=api_key)
+            except Exception as e:
+                logger.error(f"无法初始化火山引擎 API 客户端: {e}")
+                return
+        elif "wan2.6" in gateway.lower() or "aliyun" in gateway.lower():
+            from core.services.video_service.aliyun_service import Wan2_6VideoAPI
+            try:
+                # API Key will be read from OS env by default inside the class
+                video_api = Wan2_6VideoAPI(model=gateway)
+            except Exception as e:
+                logger.error(f"无法初始化阿里百炼 API 客户端: {e}")
+                return
+        else:
+            logger.error(f"不支持的网关模型类型: {gateway}")
+            return
+            
+        logger.info(f"收到 {len(prompts)} 个分镜，待接入 API 并行生成...")
+        
+        # We can fire them all asynchronously
+        async def submit_and_wait(prompt_text, idx):
+            try:
+                task_id = await video_api.submit_task(prompt_text)
+                logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
+                
+                # Poll loop
+                max_retries = 60
+                for _ in range(max_retries):
+                    await asyncio.sleep(5)
+                    status_info = await video_api.check_status(task_id)
+                    status = status_info.get("status")
+                    
+                    if status == "succeeded":
+                        video_url = status_info.get("video_url")
+                        logger.info(f"[Task {idx}] 生成成功! 视频 URL: {video_url}")
+                        
+                        # 下载视频到本地 Download 文件夹
+                        download_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Download")
+                        if not os.path.exists(download_dir):
+                            os.makedirs(download_dir)
+                            
+                        # Use a zero-padded index for clean sorting (e.g., 01, 02)
+                        padded_idx = str(idx).zfill(2)
+                        file_name = f"第{padded_idx}集_task_{task_id[:6]}.mp4"
+                        file_path = os.path.join(download_dir, file_name)
+                        
+                        logger.info(f"[Task {idx}] 正在下载视频到: {file_path}")
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(video_url) as resp:
+                                    if resp.status == 200:
+                                        with open(file_path, 'wb') as f:
+                                            f.write(await resp.read())
+                                        logger.info(f"[Task {idx}] ✅ 视频已成功下载至本地: {file_name}")
+                                        # 可以返回本地路径供后续界面或逻辑使用
+                                        return file_path
+                                    else:
+                                        logger.error(f"[Task {idx}] 视频下载失败，HTTP状态码: {resp.status}")
+                                        return video_url
+                        except Exception as e:
+                            logger.error(f"[Task {idx}] 下载视频时发生异常: {e}")
+                            return video_url
+                    elif status == "failed":
+                        err = status_info.get("error")
+                        logger.error(f"[Task {idx}] 生成失败: {err}")
+                        return None
+                    elif status in ["running", "queued"]:
+                        logger.info(f"[Task {idx}] 等待生成中... 状态: {status}")
+                        continue
+                    else:
+                        logger.warning(f"[Task {idx}] 未知状态: {status}")
+                        return None
+                        
+                logger.error(f"[Task {idx}] 轮询超时")
+                return None
+            except Exception as e:
+                logger.error(f"[Task {idx}] 发生异常: {e}")
+                return None
+                
+        tasks = [submit_and_wait(p, i+1) for i, p in enumerate(prompts)]
+        results = await asyncio.gather(*tasks)
+        
+        success_count = sum(1 for r in results if r)
+        logger.info(f"🎉 视频生成批次结束！成功 {success_count}/{len(prompts)} 个。")
