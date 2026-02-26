@@ -4,8 +4,19 @@ import logging
 import json
 import re
 import os
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
 
 logger = logging.getLogger(__name__)
+
+def _is_requests_retryable(e: BaseException) -> bool:
+    import requests
+    if isinstance(e, requests.exceptions.HTTPError):
+        resp = getattr(e, 'response', None)
+        if resp is not None and getattr(resp, 'status_code', 500) in (400, 401, 403, 404):
+            return False # Business/Auth failures, immediately fail and propagate
+    if isinstance(e, requests.exceptions.RequestException):
+        return True
+    return False
 
 from core.config import settings
 
@@ -63,6 +74,7 @@ STYLE_PRESETS = {
 
 class DeepSeekService:
     @staticmethod
+    @retry(wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(5), retry=retry_if_exception(_is_requests_retryable))
     def call_openai_compatible_api(base_url: str, api_key: str, model: str, message: str, timeout: int = 150):
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
@@ -90,7 +102,11 @@ class DeepSeekService:
     def call_deepseek(message: str):
         """依次尝试各个免费反向代理调用 DeepSeek"""
         for proxy in FREE_PROXY_ENDPOINTS:
-            proxy_model = proxy["model_map"].get("deepseek-chat", "deepseek-v3")
+            model_map = proxy.get("model_map", {})
+            if isinstance(model_map, dict):
+                proxy_model = model_map.get("deepseek-chat", "deepseek-v3")
+            else:
+                proxy_model = "deepseek-v3"
             logger.info(f"🔁 尝试公共服务: [{proxy['name']}] model={proxy_model}")
             try:
                 content = DeepSeekService.call_openai_compatible_api(
@@ -130,36 +146,35 @@ class DeepSeekService:
         if res: return res
         
         # Repair missing bracket
-        if raw_json.startswith('['):
+        if isinstance(raw_json, str) and raw_json.startswith('['):
             if not raw_json.endswith(']'):
                 last_brace = raw_json.rfind('}')
                 if last_brace != -1:
-                    repaired = raw_json[:last_brace+1] + ']'
+                    repaired = str(raw_json)[:int(last_brace)+1] + ']'
                     res = try_parse(repaired)
                     if res:
                         logger.warning(f"✅ 修复了被截断的 JSON，成功挽救 {len(res)} 条分镜。")
                         return res
         return None
 
-    @staticmethod
-    def smart_chunk_text(text, chunk_size=1200):
-        text = text.strip()
+    def smart_chunk_text(raw_text: str, chunk_size: int = 1200) -> list:
+        text_str = str(raw_text).strip()
         chunks = []
-        start = 0
-        while start < len(text):
-            end = start + chunk_size
-            if end >= len(text):
-                chunk = text[start:].strip()
+        start_idx = 0
+        while start_idx < len(text_str):
+            end_idx = start_idx + chunk_size
+            if end_idx >= len(text_str):
+                chunk = text_str[start_idx:].strip()
                 if chunk: chunks.append(chunk)
                 break
             for sep in ['\n\n', '\n', '。', '！', '？']:
-                split_at = text.rfind(sep, start, end)
-                if split_at > start:
-                    end = split_at + len(sep)
+                split_at = text_str.rfind(sep, start_idx, end_idx)
+                if split_at > start_idx:
+                    end_idx = split_at + len(sep)
                     break
-            chunk = text[start:end].strip()
+            chunk = text_str[start_idx:end_idx].strip()
             if chunk: chunks.append(chunk)
-            start = end
+            start_idx = end_idx
         return chunks
 
     @staticmethod

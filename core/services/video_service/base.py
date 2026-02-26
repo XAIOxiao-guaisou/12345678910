@@ -14,7 +14,7 @@ class BaseVideoGeneratorAPI(ABC):
         提交生成任务到平台 API
         返回: Task ID (字符串)
         """
-        pass
+        return ""
 
     @abstractmethod
     async def check_status(self, task_id: str) -> dict:
@@ -22,7 +22,7 @@ class BaseVideoGeneratorAPI(ABC):
         根据 Task ID 查询生成进度
         返回: {"status": "processing"|"success"|"failed", "video_url": "...", "error": "..."}
         """
-        pass
+        return {}
 
     async def download_video(self, url: str, filepath: str) -> str:
         """

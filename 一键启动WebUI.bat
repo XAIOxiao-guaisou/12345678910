@@ -1,22 +1,17 @@
 @echo off
 chcp 65001 >nul
-title Aiduanju API Engine - WebUI Server
-color 0B
+echo ==================================================
+echo         AI短剧自动化流水线 2.0 (多进程集群)
+echo ==================================================
 
-echo =======================================================
-echo          [Aiduanju API Engine] 启动程序
-echo =======================================================
-echo.
-echo 正在启动底层 API 网关服务及 Web 监控台...
-echo.
-echo 如果需要退出，请在此窗口按下 [Ctrl + C]。
-echo 访问地址: http://127.0.0.1:8000 
-echo.
-echo =======================================================
-echo.
+echo 正在启动前端 API 服务...
+start "Aiduanju API Engine" cmd /c "python -m uvicorn web.app:app --host 127.0.0.1 --port 8000"
 
-python -m uvicorn web.app:app --host 127.0.0.1 --port 8000
+echo 正在启动后端 Worker 守护进程...
+start "Aiduanju Worker Daemon" cmd /c "python worker.py"
 
-echo.
-echo 服务器已关闭或发生错误。
+echo ==================================================
+echo 所有服务已投递。前端可访问 http://127.0.0.1:8000
+echo Worker 控制台请查看弹出的独立黑色窗口。
+echo ==================================================
 pause

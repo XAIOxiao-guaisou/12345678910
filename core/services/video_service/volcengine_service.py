@@ -5,8 +5,20 @@ from typing import Dict
 from volcenginesdkarkruntime import Ark
 from .base import BaseVideoGeneratorAPI
 from core.config import settings
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception
 
 logger = logging.getLogger(__name__)
+
+def _is_volc_retryable(e):
+    err_str = str(e).lower()
+    from volcenginesdkarkruntime import APIError, APIConnectionError, RateLimitError
+    if isinstance(e, (APIConnectionError, RateLimitError)):
+        return True
+    if getattr(e, "status_code", 500) in (400, 401, 403, 404):
+        return False
+    if "rate" in err_str or "limit" in err_str or "timeout" in err_str or "connection" in err_str or "50" in err_str:
+        return True
+    return False
 
 class VolcengineVideoAPI(BaseVideoGeneratorAPI):
     def __init__(self, api_key: str = None, model_id: str = "doubao-seedance-1-5-pro-251215"):
@@ -20,6 +32,7 @@ class VolcengineVideoAPI(BaseVideoGeneratorAPI):
         else:
             self.client = Ark(api_key=self.api_key)
 
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=20), stop=stop_after_attempt(5), retry=retry_if_exception(_is_volc_retryable))
     async def submit_task(self, prompt: str, **kwargs) -> str:
         if not self.client:
             raise ValueError("Volcengine API Key not configured.")
@@ -47,6 +60,7 @@ class VolcengineVideoAPI(BaseVideoGeneratorAPI):
             logger.error(f"Failed to submit task to Volcengine: {e}")
             raise
 
+    @retry(wait=wait_exponential(multiplier=1, min=2, max=20), stop=stop_after_attempt(5), retry=retry_if_exception(_is_volc_retryable))
     async def check_status(self, task_id: str) -> Dict:
         if not self.client:
             raise ValueError("Volcengine API Key not configured.")

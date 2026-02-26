@@ -34,8 +34,10 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
             res = await asyncio.to_thread(pipeline.process_novel_to_feishu, text, style_key=style)
             if res.get("status") == "success" and res.get("prompts"):
                 prompts = res.get("prompts", [])
-                logger.info(f"✨ 拆解完成 (风格: {style})，获取到 {len(prompts)} 个分镜，准备自动入列视频生成！")
-                await pipeline.run_video_generation(account, prompts, gateway=gateway)
+                logger.info(f"✨ 拆解完成 (风格: {style})，获取到 {len(prompts)} 个分镜并写入飞书。")
+                logger.info(f"✨ API 接口已快速释放，后台 Worker 守护进程接管分镜视频生成逻辑！")
+                # 核心改动：不再由 FastAPI 亲历亲为地直接生成视频
+                # await pipeline.run_video_generation(account, prompts, gateway=gateway)
             else:
                 logger.error("❌ 拆解失败或没有获取到分镜。")
         except Exception as e:
@@ -55,7 +57,7 @@ async def get_logs(lines: int = 50):
         with open(LOG_FILE, 'r', encoding='utf-8') as f:
             all_lines = f.readlines()
             result_logs = []
-            for line in all_lines[-lines:]:
+            for line in all_lines[-int(lines):]:
                 line = line.strip()
                 # Truncate extremely long lines (like API requests with huge tokens) so they don't wrap and fill the screen
                 if len(line) > 180:
@@ -95,7 +97,7 @@ async def get_outputs():
                             "name": f,
                             "path": os.path.abspath(filepath),
                             "time": mtime,
-                            "size": round(size / (1024 * 1024), 2) # MB
+                            "size": round(float(size) / (1024 * 1024), 2) # MB
                         })
                     except:
                         pass
@@ -105,6 +107,6 @@ async def get_outputs():
     
     import datetime
     for item in files_info:
-        item["time_str"] = datetime.datetime.fromtimestamp(item["time"]).strftime('%m-%d %H:%M:%S')
+        item["time_str"] = datetime.datetime.fromtimestamp(float(item["time"])).strftime('%m-%d %H:%M:%S')
         
     return {"files": files_info}

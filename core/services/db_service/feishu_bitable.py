@@ -58,13 +58,13 @@ class FeishuBitableManager:
         }
 
     def _purge_table(self, app_token, table_id, label="表格"):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/search"
-        base_url   = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records"
+        batch_delete_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
 
         try:
             all_ids = []
             page_token = None
+            # 1. 收集所有记录 ID
             while True:
                 payload = {"page_size": 500}
                 if page_token: payload["page_token"] = page_token
@@ -80,23 +80,21 @@ class FeishuBitableManager:
                 logger.info(f"🧹 [{label}] 已是空表。")
                 return 0
 
-            logger.info(f"🧹 [{label}] 删除 {total} 条记录...")
+            logger.info(f"🧹 [{label}] 查找到 {total} 条记录，准备批量删除...")
 
-            def _del_one(rid):
-                r = requests.delete(f"{base_url}/{rid}", headers=self._get_headers())
-                try:
-                    body = r.json()
-                    return rid, body.get("code", -1), body.get("data", {}).get("deleted", False)
-                except Exception:
-                    return rid, -1, False
-
+            # 2. 按 500 条一批进行批量删除 (安全且极速)
             deleted = 0
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                futures = {pool.submit(_del_one, rid): rid for rid in all_ids}
-                for ft in as_completed(futures):
-                    rid, code, is_del = ft.result()
-                    if code == 0 and is_del: deleted += 1
+            batch_size = 500
+            for i in range(0, total, batch_size):
+                batch_ids = all_ids[i:i + batch_size]
+                payload = {"records": batch_ids}
+                r = requests.post(batch_delete_url, headers=self._get_headers(), json=payload)
+                if r.ok and r.json().get("code") == 0:
+                    deleted += len(batch_ids)
+                else:
+                    logger.error(f"批量删除失败: {r.text}")
 
+            logger.info(f"🧹 [{label}] 成功删除 {deleted} 条记录。")
             return deleted
         except Exception as e:
             logger.error(f"_purge_table [{label}] 异常: {e}")
@@ -250,7 +248,7 @@ class FeishuBitableManager:
             records.append({"fields": {
                 "集数/场次": episode_start + i,
                 "小说原文（内容）": scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}"), 
-                "状态": ["拆解中"],
+                "状态": ["待生成"],
                 "场景描述": f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}",
                 "视觉提示词": visual_prompt,
                 "音频提示词": audio_prompt
@@ -274,8 +272,9 @@ class FeishuBitableManager:
                 logger.info(f"📋 第 {batch_start//batch_size+1} 批写入飞书完成 ({len(new_ids)} 条).")
             except Exception as e:
                 err_msg = str(e)
-                if hasattr(e, 'response') and e.response is not None:
-                    err_msg += f" | Response: {e.response.text}"
+                resp = getattr(e, 'response', None)
+                if resp is not None:
+                    err_msg += f" | Response: {getattr(resp, 'text', '')}"
                 logger.error(f"Error bulk inserting batch: {err_msg}")
         return created_ids
 
@@ -294,3 +293,209 @@ class FeishuBitableManager:
                     total += len(resp.json().get("data", {}).get("records", []))
             except Exception: pass
         return total
+
+    def update_record(self, record_id: str, fields: dict):
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/{record_id}"
+        payload = {"fields": fields}
+        try:
+            resp = requests.put(url, headers=self._get_headers(), json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") == 0:
+                return True
+            else:
+                logger.error(f"更新记录失败: {data}")
+                return False
+        except Exception as e:
+            logger.error(f"更新记录发生异常: {e}")
+            return False
+
+    def get_pending_tasks(self):
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/search"
+        payload = {
+            "filter": {
+                "conjunction": "and",
+                "conditions": [
+                    {
+                        "field_name": "状态",
+                        "operator": "contains",
+                        "value": ["待生成"]
+                    }
+                ]
+            }
+        }
+        try:
+            resp = requests.post(url, headers=self._get_headers(), json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                logger.error(f"获取待生成任务失败: {data}")
+                return []
+            
+            items = data.get("data", {}).get("items", [])
+            tasks = []
+            for item in items:
+                fields = item.get("fields", {})
+                
+                # Helper to unpack lists or single items
+                def unpack(v):
+                    if isinstance(v, list) and len(v) > 0:
+                        if isinstance(v[0], dict):
+                            return v[0].get("text", "")
+                        return v[0]
+                    return v
+
+                tasks.append({
+                    "record_id": item.get("record_id"),
+                    "visual_prompt": unpack(fields.get("视觉提示词", "")),
+                    # The Gateway field can be specified dynamically later; assuming "seedance-1.5-pro" temporarily
+                    "video_model": unpack(fields.get("网关模型", "seedance-1.5-pro")) 
+                })
+            return tasks
+        except Exception as e:
+            logger.error(f"获取待生成任务异常: {e}")
+            return []
+
+    def get_processing_tasks(self):
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/search"
+        payload = {
+            "filter": {
+                "conjunction": "and",
+                "conditions": [{"field_name": "状态", "operator": "contains", "value": ["生成中"]}]
+            }
+        }
+        try:
+            resp = requests.post(url, headers=self._get_headers(), json=payload)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            return [r.get("record_id") for r in data.get("items", [])]
+        except Exception:
+            return []
+
+    def reset_zombie_tasks(self):
+        zombie_ids = self.get_processing_tasks()
+        if not zombie_ids:
+            return
+        logger.info(f"发现 {len(zombie_ids)} 个僵尸任务，正在重置为待生成...")
+        for rid in zombie_ids:
+            self.update_record(rid, {"状态": ["待生成"], "异常日志": "进程意外中断，状态已自愈重置"})
+
+    def upload_media(self, file_path: str, parent_type="bitable_file", parent_node=""):
+        if not os.path.exists(file_path):
+            logger.error(f"文件不存在: {file_path}")
+            return None
+            
+        file_size = os.path.getsize(file_path)
+        file_name = os.path.basename(file_path)
+        
+        # Determine upload method based on size (20MB threshold)
+        if file_size < 20 * 1024 * 1024:
+            return self._upload_all(file_path, file_name, file_size, parent_type, parent_node)
+        else:
+            return self._upload_chunked(file_path, file_name, file_size, parent_type, parent_node)
+
+    def _upload_all(self, file_path, file_name, file_size, parent_type, parent_node):
+        url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_all"
+        headers = {"Authorization": f"Bearer {self._get_token()}"}
+        
+        data = {
+            "file_name": file_name,
+            "parent_type": parent_type,
+            "parent_node": parent_node or APP_TOKEN_SCRIPT,
+            "size": str(file_size)
+        }
+        
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (file_name, f)}
+                resp = requests.post(url, headers=headers, data=data, files=files)
+                resp.raise_for_status()
+                res_data = resp.json()
+                if res_data.get("code") == 0:
+                    return res_data.get("data", {}).get("file_token")
+                else:
+                    logger.error(f"普通上传失败: {res_data}")
+                    return None
+        except Exception as e:
+            logger.error(f"上传异常: {e}")
+            return None
+
+    def _upload_chunked(self, file_path, file_name, file_size, parent_type, parent_node):
+        headers = {"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"}
+        parent_node = parent_node or APP_TOKEN_SCRIPT
+        
+        # 1. Prepare
+        prepare_url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_prepare"
+        payload = {
+            "file_name": file_name,
+            "parent_type": parent_type,
+            "parent_node": parent_node,
+            "size": file_size
+        }
+        resp = requests.post(prepare_url, headers=headers, json=payload)
+        res_data = resp.json()
+        if res_data.get("code") != 0:
+            logger.error(f"分片上传准备失败: {res_data}")
+            return None
+        
+        upload_id = res_data.get("data", {}).get("upload_id")
+        # STRICT 4MB Rule imposed by Feishu
+        block_size = res_data.get("data", {}).get("block_size", 4194304) 
+        if block_size != 4194304:
+            logger.warning(f"Feishu requested a block size of {block_size}, but applying standard 4MB chunk limit.")
+            block_size = 4194304
+        
+        # 2. Upload parts
+        part_url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_part"
+        part_headers = {"Authorization": f"Bearer {self._get_token()}"}
+        
+        try:
+            with open(file_path, "rb") as f:
+                seq = 0
+                while True:
+                    chunk = f.read(block_size)
+                    if not chunk:
+                        break
+                    
+                    data = {
+                        "upload_id": upload_id,
+                        "seq": str(seq),
+                        "size": str(len(chunk))
+                    }
+                    files = {"file": chunk}
+                    part_resp = requests.post(part_url, headers=part_headers, data=data, files=files)
+                    part_res_data = part_resp.json()
+                    if part_res_data.get("code") != 0:
+                        logger.error(f"分片上传块 {seq} 失败: {part_res_data}")
+                        return None
+                    seq += 1
+                    
+            # 3. Finish
+            finish_url = "https://open.feishu.cn/open-apis/drive/v1/medias/upload_finish"
+            finish_payload = {
+                "upload_id": upload_id,
+                "block_num": seq
+            }
+            finish_resp = requests.post(finish_url, headers=headers, json=finish_payload)
+            finish_res_data = finish_resp.json()
+            if finish_res_data.get("code") == 0:
+                return finish_res_data.get("data", {}).get("file_token")
+            else:
+                logger.error(f"分片上传结束失败: {finish_res_data}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"分片上传异常: {e}")
+            return None
+
+    def upload_attachment_and_update_record(self, record_id: str, file_path: str):
+        file_token = self.upload_media(file_path)
+        if file_token:
+            # 飞书多维表格附件字段格式是一组由 file_token 构成的对象数组
+            fields = {
+                "视频文件": [{"file_token": file_token}],
+                "状态": "已完成",
+                "异常日志": "" # 清空报错
+            }
+            return self.update_record(record_id, fields)
+        return False
