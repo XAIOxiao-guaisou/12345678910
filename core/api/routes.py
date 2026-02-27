@@ -36,6 +36,8 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
     llm_temperature = req.llm_temperature
     top_p = req.top_p
     chunk_size = req.chunk_size
+    video_params = req.video_params
+    
     if not text:
         return {"status": "error", "message": "文章内容为空！"}
     
@@ -48,7 +50,8 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
                 style_key=style,
                 llm_temperature=llm_temperature,
                 top_p=top_p,
-                chunk_size=chunk_size
+                chunk_size=chunk_size,
+                video_params=video_params
             )
             if res.get("status") == "success" and res.get("prompts"):
                 prompts = res.get("prompts", [])

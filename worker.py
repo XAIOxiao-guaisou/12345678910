@@ -14,6 +14,19 @@ async def process_single_task(feishu_manager, task, download_dir):
     prompt = task["visual_prompt"]
     gateway = task["video_model"]
     
+    # Extract embedded JSON config if present
+    import re, json
+    config = {}
+    config_match = re.search(r'\[RENDER_CONFIG\](.*?)\[/RENDER_CONFIG\]', prompt, re.DOTALL)
+    if config_match:
+        try:
+            config = json.loads(config_match.group(1).strip())
+            prompt = re.sub(r'\n*\[RENDER_CONFIG\].*?\[/RENDER_CONFIG\]', '', prompt, flags=re.DOTALL).strip()
+        except:
+            logger.warning(f"未能解析附加参数 JSON: {config_match.group(1)}")
+            
+
+    
     try:
         # 1. 锁定状态 -> 生成中
         feishu_manager.update_record(record_id, {"状态": ["生成中"]})
@@ -22,6 +35,8 @@ async def process_single_task(feishu_manager, task, download_dir):
         # 2. 判断是否开启 Mock 模式
         if settings.MOCK_MODE:
             logger.warning(f"🧪 [Task {record_id}] MOCK_MODE 已开启，跳过真实视频生成，模拟秒级完成！")
+            logger.info(f"🧪 [Task {record_id}] Target API Payload (参数透传验证):\n> Render Prompt: {prompt}\n> Render Config: {json.dumps(config, indent=2)}")
+            
             await asyncio.sleep(2)  # Simulate small delay
             file_name = f"video_{record_id}_mock.mp4"
             final_path = os.path.join(download_dir, file_name)
@@ -29,13 +44,13 @@ async def process_single_task(feishu_manager, task, download_dir):
             
             logger.info(f"[Task {record_id}] Mock 本地文件创建成功: {final_path}，准备直传飞书...")
             gateway_display = f"{gateway} (MOCK 模拟)"
-            cost_estimate = "\n> **预估真实消耗:** 约 300 秒及对应模型算力"
+            cost_estimate = f"\n> **调度参数:** {json.dumps(config)}\n> **预估真实消耗:** 约 300 秒及对应模型算力"
             
         else:
             # 原有的真实提交逻辑
             video_api = VideoServiceFactory.get_service(gateway)
-            task_id = await video_api.submit_task(prompt)
-            logger.info(f"[Task {record_id}] API 提交成功，任务 ID: {task_id}")
+            task_id = await video_api.submit_task(prompt, **config)
+            logger.info(f"[Task {record_id}] API 提交成功 (Config: {config})，任务 ID: {task_id}")
             
             # 3. 轮询状态
             while True:

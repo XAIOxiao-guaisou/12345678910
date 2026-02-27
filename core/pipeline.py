@@ -11,14 +11,13 @@ class PipelineOrchestrator:
     def __init__(self):
         self.bitable = FeishuBitableManager()
 
-    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime", llm_temperature: float = 0.7, top_p: float = 1.0, chunk_size: int = 1200):
+    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime", llm_temperature: float = 0.7, top_p: float = 1.0, chunk_size: int = 1200, video_params: dict = None):
         logger.info(f"======== 开始小说全自动上云飞书 (DeepSeek, Style: {style_key}) ========")
         
-        # 1. 彻底清空四张表
+        # 1. 彻底清空工作表
         logger.info("清理历史积累表数据...")
         self.bitable.purge_all_records()
         self.bitable.purge_factory_records()
-        self.bitable.purge_assets_records()
         self.bitable.purge_memory_records()
         
         # 2. 阶段一：记忆灌注与空间构建 (建档)
@@ -33,6 +32,11 @@ class PipelineOrchestrator:
 
         # Fetch all memories (simulate real decoupling)
         all_memories = self.bitable.get_all_memories()
+
+        # 2.5 提取 Schema
+        from core.config import settings
+        table_schema = self.bitable.get_table_schema(settings.FEISHU_APP_TOKEN_SCRIPT, settings.FEISHU_TABLE_SCRIPT)
+        schema_context_str = f"【Bitable 写入目标表字段 Schema】: {table_schema}"
 
         # 3. 阶段二：自主执导与分镜 (拆解)
         chunks = DeepSeekService.smart_chunk_text(novel_text, chunk_size)
@@ -61,10 +65,10 @@ class PipelineOrchestrator:
                     relevant_memories.append(mem)
             
             # 构建记忆文段
-            memory_context_str = "【全局世界观与当前段落高度相关的记忆资产库】\n"
+            memory_context_str = f"{schema_context_str}\n\n【全局世界观与当前段落高度相关的记忆资产库（实体预扫描）】\n"
             for rm in relevant_memories:
                 alias_str = f"（代称/别名：{', '.join(rm.get('aliases', []))}）" if rm.get('aliases') else ""
-                memory_context_str += f"- [{rm.get('category', '设定')}] {rm.get('name', '')} {alias_str}：\n  核心设定：{rm.get('lore', '')}\n  视觉隐喻：{rm.get('visual_aura', '')}\n\n"
+                memory_context_str += f"- [实体: {rm.get('entity_id', '未注册')}] [{rm.get('category', '设定')}] {rm.get('name', '')} {alias_str}：\n  物理与运转规律：{rm.get('lore', '')}\n  视觉约束：{rm.get('visual_constraints', '')}\n  实体依赖：{rm.get('dependencies', [])}\n\n"
 
             if temporal_summary_memory or temporal_visual_memory:
                 memory_context_str += "\n【短期连续性记忆（承接上文）】\n"
@@ -93,10 +97,42 @@ class PipelineOrchestrator:
             
         for idx, scene in enumerate(all_scenes):
             scene["_episode"] = idx + 1
+            if video_params:
+                import json
+                config_str = f"\n\n[RENDER_CONFIG]\n{json.dumps(video_params, ensure_ascii=False)}\n[/RENDER_CONFIG]"
+                if scene.get("master_prompt"):
+                    scene["master_prompt"] += config_str
+                elif scene.get("visual_prompt"):
+                    scene["visual_prompt"] += config_str
+                else:
+                    scene["visual_prompt"] = config_str
             
         # 4. 回填飞书
         logger.info("云端写入剧本拆解（两阶段生成）...")
         inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1)
+
+        # 5. 阶段三：一致性审计与自闭环 (Stage 3)
+        logger.info("执行阶段三：全量内容的一致性审计 (Stage 3)...")
+        import json
+        audit_result = DeepSeekService.consistency_audit(json.dumps(all_scenes, ensure_ascii=False), memory_context_str)
+        fixes = audit_result.get("fixes", [])
+        if fixes:
+            logger.info(f"审计发现 {len(fixes)} 处断层或主观形容词，正在执行自动修正 (Patching Bitable)...")
+            if len(inserted_ids) == len(all_scenes):
+                scene_num_to_record_id = {scene.get("scene_num", i+1): inserted_ids[i] for i, scene in enumerate(all_scenes)}
+                for fix in fixes:
+                    s_num = fix.get("scene_num")
+                    updated_prompt = fix.get("updated_visual_prompt")
+                    reason = fix.get("reason", "")
+                    if s_num in scene_num_to_record_id and updated_prompt:
+                        rid = scene_num_to_record_id[s_num]
+                        logger.info(f"修正场景 {s_num}: {reason}")
+                        field_name = "视觉提示词" if "视觉提示词" in table_schema else ("Visual Prompt" if "Visual Prompt" in table_schema else "视频提示词")
+                        self.bitable.update_record(rid, {field_name: updated_prompt, "异常日志": f"[Stage 3 审计修正] {reason}"})
+            else:
+                logger.warning("插入记录数不匹配，跳过精准修正。")
+        else:
+            logger.info("✅ 审计通过，镜头物理逻辑完备连贯。")
 
         prompts = [scene.get("master_prompt", scene.get("visual_prompt", "")) for scene in all_scenes if scene.get("master_prompt") or scene.get("visual_prompt")]
 

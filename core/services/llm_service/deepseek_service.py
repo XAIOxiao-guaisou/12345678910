@@ -209,17 +209,25 @@ class DeepSeekService:
     def generate_memory_context(text):
         sample = text[:3000]
         prompt = f"""
-你现在是一个独立运作的 AI 影视世界观架构师。你的内部拥有一个『记忆中枢』空间。
+你现在是一个独立运作的 AI 影视世界观架构师，你的核心任务是为随后的参数化渲染引擎（如 Wan2.6/Seedance）建立“视觉资产库”。
 我将输入一部小说的开篇或背景。请你自主思考并在你的空间内建立这部作品的视觉与逻辑地基。
 
 你的任务：
-提取并总结这个世界的客观规律、核心地标、重要道具和深层氛围。不要局限于表面的文字，去感知文字背后的情绪基调。
+提取并总结这个世界的客观规律、核心实体（角色/地标/道具）。对于每个实体，不要使用主观形容词（如“绝美、震撼”），而是定义其**物理参量与视觉排他性约束**。
 
 输出要求：
-请输出一段 JSON 数组，用于写入飞书【记忆中枢】表格。
+必须输出一个标准 JSON 数组，用于回写飞书【记忆中枢】表。
 格式如下：
 [
-  {{"category": "类别(如世界观/核心角色/地标/道具)", "name": "核心名字", "aliases": ["代称1", "尊称2", "他/她(如果是主角)"], "lore": "深层设定逻辑", "visual_aura": "你自主决定的视觉氛围与美学隐喻"}}
+  {{
+    "entity_id": "rec_唯一英文标识符(如 rec_chen_ling)",
+    "category": "类别(如世界观/角色/地标/道具)", 
+    "name": "核心名字", 
+    "aliases": ["代称1", "尊称2", "他/她(如果是主角)"], 
+    "lore": "深层设定逻辑与物理运转规律", 
+    "visual_constraints": "视觉排他性约束（必须是物理参量，如：色温 3200K，高对比度，焦距 35mm，红黑主色调。禁止主观描述）",
+    "dependencies": ["依赖的其它 entity_id，或填写无"]
+  }}
 ]
 
 小说原文：
@@ -242,33 +250,40 @@ class DeepSeekService:
     @staticmethod
     def generate_scenes_for_chunk(chunk_text, memory_context_str, temperature: float = 0.7, top_p: float = 1.0):
         prompt = f"""# Role
-你是一位极具审美直觉的 AI 电影总导演。你正在将小说的内容转化为严格的分镜视频生成提词。
-你不需要听从任何死板的摄影指令，但必须严格遵循一致性协议和记忆库资产。
+你是一个“资产调度员与渲染协议专家”，正在为后端视频渲染引擎编写严格的调度指令。
+你不需要“想象画面”，而是基于 Bitable 已有资产，输出符合视频模型物理参数的调度指令。
 
-【你的记忆空间】（由系统动态传入）：
+【你的视觉资产库（Bitable 记录）】：
 {memory_context_str}
 
-【当前待拍摄剧本】：
+【当前待渲染剧本段落】：
 {chunk_text}
 
 你的执导任务与结构化协议：
 
-1. 视觉指纹 (Visual Fingerprints)：你必须严格跟随【记忆空间】提供的视觉指纹。若剧本涉及已定义实体或角色，你的描述必须以其实体对应的 visual_aura 为核心逻辑进行延展。如果未定义，请根据全局世界观/氛围进行补充，但严禁引入与设定相悖的物理描述。
-   
-2. 动作连贯性协议 (Kinematic Continuity)：在多镜头描述中，确保角色动作具有空间连续性。禁止在 15 秒内的分镜中出现光影方向的突兀逆转或角色位置瞬移。参考【短期连续性记忆】保持机位和光线的基础逻辑。
+1. 资产调用与代词对齐 (Entity Resolution)：
+   - 你必须首先识别剧本中的“他/她/它”到底指向【视觉资产库】中的哪个 `entity_id`。
+   - 在描述画面时，必须显式声明 `[引用资产: entity_id]`，并严格继承该资产的 `visual_constraints`。
+   - **注册拦截**：如果剧本出现了一个在资产库中不存在的新核心实体，你必须首先在 `director_notes` 中输出 `[NEW_ASSET_REQUEST: 实体名]` 信号。
 
-3. 去主观化指令 (Objective Translation)：你的任务是『翻译』而非『创作』。将剧本的戏剧动作转化为高维度的符合视频模型理解的客观视觉物理量描述（如光影方向、构图层次、材质质感、动作轨迹），用充满电影感的语言替代死板的提示词堆砌。
+2. 去主观化与物理参量输出 (Physical Output)：
+   - 严禁使用“宏大、精美、震撼、绝美”等感性词汇。
+   - 必须使用具体的摄影机物理参量来描述画面（例如：焦距 35mm，光圈 f/2.8，色温 5600K，低调照明，构图比例等）。
+   - 你可以通过调用预设风格来统一视觉，或者直接给出具体的物理参数约束。
 
-4. 禁止私自衍生 (Anti-Hallucination)：绝对禁止为了增加“电影感”而私自添加未在【记忆空间】定义且与此段剧本无关的宏大背景、复杂群体或花哨道具。所有的视觉元素必须在此前记忆中枢的管控范围内，保持画面聚焦与视觉资产纯净度。
+3. 短期连续性 (Kinematic Continuity)：
+   - 必须参考【短期连续性记忆】（上一首分镜的视觉信息），确保 15秒 尺度上角色的空间位置、光影方向的连续性。
+
+4. Schema 遵循 (Schema Alignment)：
+   - 你输出的 JSON 键名必须与规定的格式严格一致，为下一步数据库写入作准备。
 
 输出规范 (严格 JSON 数组)：
-请将你的构思转化为以下 JSON，以便制片系统分配任务：
 [
   {{
     "scene_num": 1,
     "summary": "简要剧情逻辑与动作（承上启下）",
-    "director_notes": "导演手记：解释为何这样安排站位与光影，体现了何种情绪",
-    "visual_prompt": "高维电影感画面描述（必须包含主体的动作、环境光影、且无缝融合对应的 visual_aura。适合中文视频大模型 Wan2.6 直接读取）",
+    "director_notes": "调度手记：解释参数选择逻辑。如有未注册新实体，输出 [NEW_ASSET_REQUEST: xxx]",
+    "visual_prompt": "高维电影物理参数描述。必须包含完整的物理参量与光影设定，且必须显式声明 [引用资产: entity_id]。禁止主观修饰词。",
     "audio_prompt": "背景音景与台词"
   }}
 ]
@@ -287,3 +302,53 @@ class DeepSeekService:
                 pass
             time.sleep(2)
         return []
+
+    @staticmethod
+    def consistency_audit(scenes_array_json: str, memory_context_str: str, temperature: float = 0.2, top_p: float = 0.9):
+        """
+        Stage 3: Consistency Audit Phase
+        回顾生成的全部场景，检查是否有光影突变、角色衣着断层现象，并返回修正补丁。
+        """
+        import re
+        safe_scenes_json = re.sub(r'\\n*\[RENDER_CONFIG\].*?\[/RENDER_CONFIG\]', '', scenes_array_json, flags=re.DOTALL)
+        
+        prompt = f"""# Role
+你是一个“时空一致性审计员”。你的任务是对生成的连续镜头的调度参数进行宏观审查。
+
+【全量视觉资产库】：
+{memory_context_str}
+
+【已生成的全场次渲染指令】：
+{safe_scenes_json}
+
+审计任务：
+检查场景 1 到 N 之间，针对同一个 entity_id 的以下物理连贯性是否发生逻辑断层：
+1. 服装/道具状态一致性（如：前一场衣服破了，后一场不能完好无损）。
+2. 环境光影一致性（同一时间的室外戏，太阳光影方向和色温是否突然跳跃）。
+3. 物理位置一致性。
+
+输出规范（必须是严格的 JSON 对象）：
+如果发现断层，或者需要将主观描述纠正为物理描述，请输出需要修正的补丁名单。
+如果完美无需修改，输出 {{"fixes": []}}。
+格式如下：
+{{
+  "fixes": [
+    {{
+      "scene_num": 对应断层的场景号,
+      "reason": "指出具体的断层原因或违规的主观词",
+      "updated_visual_prompt": "修正后的完整 [visual_prompt]，必须替换为主客观的物理参量并保持前后连贯"
+    }}
+  ]
+}}
+"""
+        logger.info("DeepSeek 执行一致性审计 (Stage 3)...")
+        for _ in range(3):
+            try:
+                result_text = DeepSeekService.call_deepseek(prompt, temperature=temperature, top_p=top_p)
+                parsed = DeepSeekService.extract_json_from_deepseek(result_text)
+                if isinstance(parsed, dict) and "fixes" in parsed:
+                    return parsed
+            except Exception as e:
+                logger.error(f"Error in consistency audit: {e}")
+            time.sleep(2)
+        return {"fixes": []}

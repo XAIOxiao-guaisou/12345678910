@@ -14,10 +14,6 @@ from core.config import settings
 APP_ID = settings.FEISHU_APP_ID
 APP_SECRET = settings.FEISHU_APP_SECRET
 
-# The Assets (角色风格库)
-APP_TOKEN_ASSETS = settings.FEISHU_APP_TOKEN_ASSETS
-TABLE_ASSETS = settings.FEISHU_TABLE_ASSETS
-
 # The Factory (素材生成表)
 APP_TOKEN_FACTORY = settings.FEISHU_APP_TOKEN_FACTORY
 TABLE_FACTORY = settings.FEISHU_TABLE_FACTORY
@@ -102,59 +98,8 @@ class FeishuBitableManager:
 
     def purge_all_records(self): return self._purge_table(APP_TOKEN_SCRIPT, TABLE_SCRIPT, "剧本拆解表")
     def purge_factory_records(self): return self._purge_table(APP_TOKEN_FACTORY, TABLE_FACTORY, "素材生成表")
-    def purge_assets_records(self): return self._purge_table(APP_TOKEN_ASSETS, TABLE_ASSETS, "角色风格库")
     def purge_memory_records(self): return self._purge_table(APP_TOKEN_MEMORY, TABLE_MEMORY, "记忆中枢")
 
-    def upsert_character_in_assets(self, character_name, appearance="", hasselblad="Hasselblad H6D-100c, 80mm, f/2.8"):
-        search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records/search"
-        create_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records"
-        fields = {
-            "角色名": character_name,
-            "外貌特征描述": appearance or f"{character_name}，气质出众。",
-            "哈苏预设参数": hasselblad
-        }
-        try:
-            resp = requests.post(search_url, headers=self._get_headers(), json={
-                "filter": {"conjunction": "and", "conditions": [{"field_name": "角色名", "operator": "is", "value": [character_name]}]}
-            })
-            resp.raise_for_status()
-            items = resp.json().get("data", {}).get("items", [])
-            if items:
-                rec_id = items[0]["record_id"]
-                if appearance:
-                    upd_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records/{rec_id}"
-                    requests.put(upd_url, headers=self._get_headers(), json={"fields": fields})
-                return rec_id
-            
-            cr = requests.post(create_url, headers=self._get_headers(), json={"fields": fields})
-            if cr.ok:
-                return cr.json().get("data", {}).get("record", {}).get("record_id")
-        except Exception as e:
-            logger.error(f" upsert_character_in_assets 失效: {e}")
-        return None
-
-    def get_style_reference(self, character_name):
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records/search"
-        payload = {"filter": {"conjunction": "and", "conditions": [{"field_name": "角色名", "operator": "is", "value": [character_name]}]}}
-        try:
-            resp = requests.post(url, headers=self._get_headers(), json=payload)
-            resp.raise_for_status()
-            records = resp.json().get("data", {}).get("items", [])
-            if not records:
-                return "Hasselblad H6D-100c, 80mm, f/2.8."
-                
-            fields = records[0].get("fields", {})
-            desc = fields.get("外貌特征描述", "")
-            hasselblad = fields.get("哈苏预设参数", "")
-            
-            def flatten(val):
-                if isinstance(val, str): return val
-                if isinstance(val, list): return "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in val)
-                return str(val)
-                
-            return f"{flatten(hasselblad)}. {flatten(desc)}"
-        except Exception as e:
-            return "Hasselblad H6D-100c, 80mm, f/2.8."
 
     def get_table_field_names(self, app_token, table_id):
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
@@ -166,6 +111,10 @@ class FeishuBitableManager:
             logger.error(f"Failed to fetch fields for table {table_id}: {e}")
         return []
 
+    def get_table_schema(self, app_token, table_id):
+        """ Alias for backwards compatibility / conceptual explicitly mapping """
+        return self.get_table_field_names(app_token, table_id)
+
     def insert_memory_records(self, memory_array):
         """写入阶段一生成的记忆中枢词条"""
         if not memory_array: return []
@@ -173,11 +122,13 @@ class FeishuBitableManager:
         
         valid_fields = self.get_table_field_names(APP_TOKEN_MEMORY, TABLE_MEMORY)
         FIELD_MAPPING = {
+            "entity_id": ["实体标识符", "实体ID", "Entity ID", "entity_id"],
             "lore": ["深层设定与逻辑", "深层设定逻辑", "设定内容", "Lore"],
-            "visual_aura": ["视觉通感", "视觉氛围与美学隐喻", "视觉指纹", "Visual Aura", "视觉氛围"],
+            "visual_constraints": ["视觉约束", "视觉排他性约束", "Visual Constraints", "视觉感官指纹"],
+            "dependencies": ["依赖关系", "Dependencies"],
             "aliases": ["代称标签", "代称", "Aliases"],
             "category": ["记忆维度", "类别", "Category"],
-            "name": ["词条名称", "词条名", "名称", "Name"]
+            "name": ["词条名称", "词条名", "名称", "Name", "name"]
         }
         def get_field(k):
             if not valid_fields: return FIELD_MAPPING[k][0]
@@ -188,13 +139,17 @@ class FeishuBitableManager:
         records = []
         for mem in memory_array:
             fields = {}
+            if get_field("entity_id") and mem.get("entity_id"): fields[get_field("entity_id")] = mem.get("entity_id")
             if get_field("category"): fields[get_field("category")] = mem.get("category", "设定")
             if get_field("name"): fields[get_field("name")] = mem.get("name", "未命名")
             if get_field("lore"): fields[get_field("lore")] = mem.get("lore", "")
-            if get_field("visual_aura"): fields[get_field("visual_aura")] = mem.get("visual_aura", "")
+            if get_field("visual_constraints"): fields[get_field("visual_constraints")] = mem.get("visual_constraints", mem.get("visual_aura", ""))
+            
+            if mem.get("dependencies") and get_field("dependencies"):
+                fields[get_field("dependencies")] = ", ".join(mem.get("dependencies")) if isinstance(mem.get("dependencies"), list) else str(mem.get("dependencies"))
             
             if mem.get("aliases") and get_field("aliases"):
-                fields[get_field("aliases")] = ", ".join(mem.get("aliases"))
+                fields[get_field("aliases")] = ", ".join(mem.get("aliases")) if isinstance(mem.get("aliases"), list) else str(mem.get("aliases"))
             records.append({"fields": fields})
 
         
@@ -238,11 +193,13 @@ class FeishuBitableManager:
                         return str(val)
 
                     all_memories.append({
-                        "category": flatten(fields.get("类别", fields.get("Category", ""))),
-                        "name": flatten(fields.get("词条名", fields.get("名称", fields.get("Name", "")))),
+                        "entity_id": flatten(fields.get("实体标识符", fields.get("实体ID", fields.get("Entity ID", "")))),
+                        "category": flatten(fields.get("类别", fields.get("记忆维度", fields.get("Category", "")))),
+                        "name": flatten(fields.get("词条名称", fields.get("词条名", fields.get("名称", fields.get("Name", ""))))),
                         "aliases": [x.strip() for x in flatten(fields.get("代称标签", fields.get("代称", fields.get("Aliases", "")))).split(",") if x.strip()],
-                        "lore": flatten(fields.get("深层设定逻辑", fields.get("设定内容", fields.get("Lore", "")))),
-                        "visual_aura": flatten(fields.get("视觉氛围与美学隐喻", fields.get("视觉指纹", fields.get("Visual Aura", ""))))
+                        "lore": flatten(fields.get("深层设定与逻辑", fields.get("深层设定逻辑", fields.get("设定内容", fields.get("Lore", ""))))),
+                        "visual_constraints": flatten(fields.get("视觉约束", fields.get("视觉排他性约束", fields.get("Visual Constraints", fields.get("视觉氛围与美学隐喻", fields.get("视觉指纹", "")))))),
+                        "dependencies": [x.strip() for x in flatten(fields.get("依赖关系", fields.get("Dependencies", ""))).split(",") if x.strip()]
                     })
                 page_token = data.get("page_token")
                 if not data.get("has_more"): break

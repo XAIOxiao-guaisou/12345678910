@@ -7,9 +7,6 @@ class Settings:
     FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a914c526d5f8dbc6")
     FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
     
-    FEISHU_APP_TOKEN_ASSETS = os.environ.get("FEISHU_APP_TOKEN_ASSETS", "Oj00bIhGVaq1cNsZsJhcMC58ndd")
-    FEISHU_TABLE_ASSETS = os.environ.get("FEISHU_TABLE_ASSETS", "tblC6L0fO7FXP3fI")
-    
     FEISHU_APP_TOKEN_FACTORY = os.environ.get("FEISHU_APP_TOKEN_FACTORY", "Cu75bLeuJarqg1s7ysscaNolnPg")
     FEISHU_TABLE_FACTORY = os.environ.get("FEISHU_TABLE_FACTORY", "tbloUrdwqG47ZmgI")
     

@@ -13,3 +13,5 @@ class NovelSubmission(BaseModel):
     llm_temperature: float = 0.7
     top_p: float = 1.0
     chunk_size: int = 1200
+    video_params: dict = {}
+
