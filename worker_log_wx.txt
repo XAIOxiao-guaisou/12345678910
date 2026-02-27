@@ -1,0 +1,26 @@
+2026-02-27 12:59:39,385 - WorkerDaemon - INFO - 🎬 Worker Daemon 已启动，正在监听飞书【待生成】队列...
+2026-02-27 13:00:43,479 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoS6Tg0hzq, 启动独立协程处理
+2026-02-27 13:00:43,479 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoS6TgffLM, 启动独立协程处理
+2026-02-27 13:00:43,479 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoS6TgUShe, 启动独立协程处理
+2026-02-27 13:00:44,891 - WorkerDaemon - INFO - [Task recvcoS6Tg0hzq] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:00:44,891 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:00:46,240 - WorkerDaemon - INFO - [Task recvcoS6TgffLM] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:00:46,240 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:00:47,662 - WorkerDaemon - INFO - [Task recvcoS6TgUShe] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:00:47,662 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:00:47,944 - WorkerDaemon - INFO - [Task recvcoS6TgffLM] API 提交成功，任务 ID: cdfbeff1-7160-4ee8-a390-945ee95b4689
+2026-02-27 13:00:47,958 - WorkerDaemon - INFO - [Task recvcoS6Tg0hzq] API 提交成功，任务 ID: 549b0b11-f2c2-42ed-9022-55be5779267e
+2026-02-27 13:00:47,961 - WorkerDaemon - INFO - [Task recvcoS6TgUShe] API 提交成功，任务 ID: 0951c15e-a750-47fe-9b66-1457d18670c3
+2026-02-27 13:01:49,268 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoS6TgUShe.mp4
+2026-02-27 13:01:49,334 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoS6Tg0hzq.mp4
+2026-02-27 13:01:49,947 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:01:49,949 - WorkerDaemon - INFO - [Task recvcoS6TgUShe] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoS6TgUShe.mp4，准备直传飞书...
+2026-02-27 13:01:53,321 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。建议在多维表格中添加该文本字段。
+2026-02-27 13:01:54,039 - core.services.db_service.feishu_bitable - ERROR - 更新记录失败: {'code': 1254063, 'msg': 'MultiSelectFieldConvFail', 'error': {'message': "Invalid request parameter: 'fields.状态.fieldValue.已完成.fieldName.状态'. Correct format : the value of 'Multiple Options' must be a list of strings. Please check and modify accordingly.", 'log_id': '20260227130155426829FC5EB4C234F866', 'troubleshooter': '排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=20260227130155426829FC5EB4C234F866&code=1254063&method_id=6965347212289556482'}}
+2026-02-27 13:01:54,041 - WorkerDaemon - ERROR - [Task recvcoS6TgUShe] 发生异常熔断: 下载成功，但上传飞书作为附件时失败
+2026-02-27 13:01:54,711 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。建议在多维表格中添加该文本字段。
+2026-02-27 13:01:56,169 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:01:56,170 - WorkerDaemon - INFO - [Task recvcoS6Tg0hzq] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoS6Tg0hzq.mp4，准备直传飞书...
+2026-02-27 13:01:59,384 - core.services.db_service.feishu_bitable - ERROR - 更新记录失败: {'code': 1254063, 'msg': 'MultiSelectFieldConvFail', 'error': {'message': "Invalid request parameter: 'fields.状态.fieldValue.已完成.fieldName.状态'. Correct format : the value of 'Multiple Options' must be a list of strings. Please check and modify accordingly.", 'log_id': '20260227130200B121645F32576A3C85F9', 'troubleshooter': '排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=20260227130200B121645F32576A3C85F9&code=1254063&method_id=6965347212289556482'}}
+2026-02-27 13:01:59,385 - WorkerDaemon - ERROR - [Task recvcoS6Tg0hzq] 发生异常熔断: 下载成功，但上传飞书作为附件时失败
+2026-02-27 13:02:00,030 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。建议在多维表格中添加该文本字段。

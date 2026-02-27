@@ -1,0 +1,5 @@
+{
+    "task.verboseLogging": true,
+    "problems.showCurrentInStatus": true,
+    "editor.allowVariableFontsInAccessibilityMode": false
+}

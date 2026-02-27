@@ -1,0 +1,49 @@
+2026-02-27 13:22:33,617 - WorkerDaemon - INFO - 🎬 Worker Daemon 已启动，正在监听飞书【待生成】队列...
+2026-02-27 13:23:16,693 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoXPxQFj7p, 启动独立协程处理
+2026-02-27 13:23:16,693 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoXPxQsz85, 启动独立协程处理
+2026-02-27 13:23:16,693 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoXPxQyWc9, 启动独立协程处理
+2026-02-27 13:23:16,693 - WorkerDaemon - INFO - ✨ 发现新任务: recvcoXPxQTR8E, 启动独立协程处理
+2026-02-27 13:23:18,130 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:23:18,130 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:23:19,561 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:23:19,561 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:23:20,984 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:23:20,985 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:23:22,455 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] 已锁定，准备使用网关 seedance-1.5-pro 生成
+2026-02-27 13:23:22,455 - core.services.video_service.factory - WARNING - 🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6
+2026-02-27 13:23:22,734 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] API 提交成功，任务 ID: c9e0478d-b0d6-411d-b9c6-ae72454c6a62
+2026-02-27 13:23:22,740 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] API 提交成功，任务 ID: 2705483d-e8f7-406d-8dbf-c872b48ec7ec
+2026-02-27 13:23:22,758 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] API 提交成功，任务 ID: f8013fd8-fa22-4dc6-9edc-3fab4c63391a
+2026-02-27 13:23:22,763 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] API 提交成功，任务 ID: d26b0d12-3246-4e1c-bde2-89f9b213476b
+2026-02-27 13:24:24,017 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQsz85.mp4
+2026-02-27 13:24:24,022 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQyWc9.mp4
+2026-02-27 13:24:24,437 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:24:24,439 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQsz85.mp4，准备直传飞书...
+2026-02-27 13:24:25,121 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。
+2026-02-27 13:24:25,798 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [视频文件] 或对应附件字段，忽略该字段重试。建议在多维表格中添加该【附件】类型字段！
+2026-02-27 13:24:27,182 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] 飞书打通完毕！✅
+2026-02-27 13:24:27,572 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] 企微通知发送成功！
+2026-02-27 13:24:27,573 - WorkerDaemon - INFO - [Task recvcoXPxQsz85] 清理本地缓存成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQsz85.mp4
+2026-02-27 13:24:27,640 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:24:27,641 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQyWc9.mp4，准备直传飞书...
+2026-02-27 13:24:28,302 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。
+2026-02-27 13:24:28,998 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [视频文件] 或对应附件字段，忽略该字段重试。建议在多维表格中添加该【附件】类型字段！
+2026-02-27 13:24:30,455 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] 飞书打通完毕！✅
+2026-02-27 13:24:30,825 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] 企微通知发送成功！
+2026-02-27 13:24:30,826 - WorkerDaemon - INFO - [Task recvcoXPxQyWc9] 清理本地缓存成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQyWc9.mp4
+2026-02-27 13:24:34,244 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQTR8E.mp4
+2026-02-27 13:24:34,284 - core.services.video_service.base - INFO - 正在下载视频到: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQFj7p.mp4
+2026-02-27 13:24:34,849 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:24:34,850 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQTR8E.mp4，准备直传飞书...
+2026-02-27 13:24:35,552 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。
+2026-02-27 13:24:36,230 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [视频文件] 或对应附件字段，忽略该字段重试。建议在多维表格中添加该【附件】类型字段！
+2026-02-27 13:24:37,654 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] 飞书打通完毕！✅
+2026-02-27 13:24:38,025 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] 企微通知发送成功！
+2026-02-27 13:24:38,026 - WorkerDaemon - INFO - [Task recvcoXPxQTR8E] 清理本地缓存成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQTR8E.mp4
+2026-02-27 13:24:38,082 - core.services.video_service.base - INFO - ✅ 视频已成功下载至本地
+2026-02-27 13:24:38,082 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] 下载本地成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQFj7p.mp4，准备直传飞书...
+2026-02-27 13:24:38,747 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [异常日志] 字段，忽略该字段重试。
+2026-02-27 13:24:39,356 - core.services.db_service.feishu_bitable - WARNING - 飞书多维表格缺少 [视频文件] 或对应附件字段，忽略该字段重试。建议在多维表格中添加该【附件】类型字段！
+2026-02-27 13:24:40,861 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] 飞书打通完毕！✅
+2026-02-27 13:24:41,227 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] 企微通知发送成功！
+2026-02-27 13:24:41,228 - WorkerDaemon - INFO - [Task recvcoXPxQFj7p] 清理本地缓存成功: D:\桌面\12345678910-2.0.0\Download\video_recvcoXPxQFj7p.mp4

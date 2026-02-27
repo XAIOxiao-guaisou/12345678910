@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+jinja2
+python-multipart
+requests
+volcengine-python-sdk[ark]
+tenacity
+aiohttp
+python-dotenv

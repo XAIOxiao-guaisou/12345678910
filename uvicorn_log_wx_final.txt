@@ -1,0 +1,40 @@
+INFO:     Started server process [27900]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+2026-02-27 13:14:54,230 - INFO - 📚 已在后台开启【闪电解文】线程 (风格: anime, 模型: seedance-1.5-pro)，文本长度：49
+INFO:     127.0.0.1:7675 - "POST /api/upload_novel HTTP/1.1" 200 OK
+2026-02-27 13:14:54,231 - INFO - ======== 开始小说全自动上云飞书 (DeepSeek, Style: anime) ========
+2026-02-27 13:14:54,231 - INFO - 清理历史积累表数据...
+2026-02-27 13:14:55,603 - INFO - 🧹 [剧本拆解表] 查找到 3 条记录，准备批量删除...
+2026-02-27 13:14:57,149 - INFO - 🧹 [剧本拆解表] 成功删除 3 条记录。
+2026-02-27 13:14:58,409 - INFO - 🧹 [素材生成表] 已是空表。
+2026-02-27 13:14:59,812 - INFO - 🧹 [角色风格库] 已是空表。
+2026-02-27 13:15:01,124 - INFO - 🧹 [记忆中枢] 已是空表。
+2026-02-27 13:15:01,125 - INFO - 进入两阶段架构：阶段一 (构建记忆中枢)...
+2026-02-27 13:15:01,126 - INFO - DeepSeek 提取记忆中枢世界观...
+2026-02-27 13:15:01,126 - INFO - 🔁 尝试公共服务: [LLM7 (高频无需注册)] model=deepseek/deepseek-chat-v3-0324
+2026-02-27 13:15:04,891 - INFO - ✅ 记忆中枢提取完毕，获得 5 条设定。
+2026-02-27 13:15:05,839 - ERROR - Feishu Memory Insert Error: {"code": 1254045, "msg": "FieldNameNotFound", "error": {"message": "Invalid request parameter: 'records[0].fields.深层设定逻辑'. Correct format : field_name not found. Please check and modify accordingly.", "log_id": "202602271315079A873800AD480037456F", "troubleshooter": "排查建议查看(Troubleshooting suggestions): https://open.feishu.cn/search?from=openapi&log_id=202602271315079A873800AD480037456F&code=1254045&method_id=6965347212289441794"}}
+2026-02-27 13:15:07,070 - INFO - 📖 小说共 49 字，切分 1 块执行拆解...
+2026-02-27 13:15:07,070 - INFO - 🧠 [正在分析 1/1 块...]
+2026-02-27 13:15:07,070 - INFO - 🔁 尝试公共服务: [LLM7 (高频无需注册)] model=deepseek/deepseek-chat-v3-0324
+2026-02-27 13:15:12,813 - INFO - DeepSeek Two-Stage Stage 2 Output (Length: 1125):
+```json
+[
+  {
+    "scene_num": 1,
+    "summary": "清晨的书房，阳光透过百叶窗洒在书桌上，橘色猫咪跃上窗台，望向窗外的飞鸟",
+    "director_notes": "开场镜头需要营造出温暖而又略带孤独的氛围，通过猫咪的动作和表情传递出好奇与探索的心理状态，同时通过环境的细节（如阳光、飞鸟）暗示出故事的主题",
+    "visual_prompt": "冰冷的晨光穿透百叶窗，在书桌上投下一片金色的光晕。橘色猫咪的毛发在阳光下泛着柔和的光泽，它轻盈地跃上窗台，身体在空中形成一道优美的弧线。猫咪转头望向窗外，眼神中充满好奇，它的瞳孔在阳光下闪烁着金色的光芒。窗外，一群飞鸟在蓝天中翩翩起舞，它们的羽毛在阳光下泛着七彩的光泽，形成一道美丽的视觉对比。整个画面充满了温暖和活力，但又略带孤独，仿佛猫咪正在寻找着什么",
+    "audio_prompt": "轻柔的窗外鸟鸣声，猫咪轻盈的跳跃声，以及远处城市的喧嚣声"
+  },
+  {
+    "scene_num": 2,
+    "summary": "猫咪继续观察窗外的飞鸟，它的眼神中...
+2026-02-27 13:15:12,813 - INFO - ✅ 第1块完成，累积分镜: 3 个
+2026-02-27 13:15:13,813 - INFO - 云端写入剧本拆解（两阶段生成）...
+2026-02-27 13:15:15,357 - INFO - 📋 第 1 批写入飞书完成 (3 条).
+2026-02-27 13:15:15,358 - INFO - 🎉 小说拆解上云已圆满结束，AI 自动化正在托管！
+2026-02-27 13:15:15,359 - INFO - ✨ 拆解完成 (风格: anime)，获取到 3 个分镜并写入飞书。
+2026-02-27 13:15:15,359 - INFO - ✨ API 接口已快速释放，后台 Worker 守护进程接管分镜视频生成逻辑！
