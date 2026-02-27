@@ -156,18 +156,47 @@ class FeishuBitableManager:
         except Exception as e:
             return "Hasselblad H6D-100c, 80mm, f/2.8."
 
+    def get_table_field_names(self, app_token, table_id):
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        try:
+            resp = requests.get(url, headers=self._get_headers())
+            if resp.ok and resp.json().get("code") == 0:
+                return [f.get("field_name") for f in resp.json().get("data", {}).get("items", [])]
+        except Exception as e:
+            logger.error(f"Failed to fetch fields for table {table_id}: {e}")
+        return []
+
     def insert_memory_records(self, memory_array):
         """写入阶段一生成的记忆中枢词条"""
         if not memory_array: return []
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_MEMORY}/tables/{TABLE_MEMORY}/records/batch_create"
+        
+        valid_fields = self.get_table_field_names(APP_TOKEN_MEMORY, TABLE_MEMORY)
+        FIELD_MAPPING = {
+            "lore": ["深层设定与逻辑", "深层设定逻辑", "设定内容", "Lore"],
+            "visual_aura": ["视觉通感", "视觉氛围与美学隐喻", "视觉指纹", "Visual Aura", "视觉氛围"],
+            "aliases": ["代称标签", "代称", "Aliases"],
+            "category": ["记忆维度", "类别", "Category"],
+            "name": ["词条名称", "词条名", "名称", "Name"]
+        }
+        def get_field(k):
+            if not valid_fields: return FIELD_MAPPING[k][0]
+            for c in FIELD_MAPPING[k]:
+                if c in valid_fields: return c
+            return None
+
         records = []
         for mem in memory_array:
-            records.append({"fields": {
-                "类别": mem.get("category", "设定"),
-                "词条名": mem.get("name", "未命名"),
-                "深层设定逻辑": mem.get("lore", ""),
-                "视觉氛围与美学隐喻": mem.get("visual_aura", "")
-            }})
+            fields = {}
+            if get_field("category"): fields[get_field("category")] = mem.get("category", "设定")
+            if get_field("name"): fields[get_field("name")] = mem.get("name", "未命名")
+            if get_field("lore"): fields[get_field("lore")] = mem.get("lore", "")
+            if get_field("visual_aura"): fields[get_field("visual_aura")] = mem.get("visual_aura", "")
+            
+            if mem.get("aliases") and get_field("aliases"):
+                fields[get_field("aliases")] = ", ".join(mem.get("aliases"))
+            records.append({"fields": fields})
+
         
         created_ids = []
         batch_size = 490
@@ -209,10 +238,11 @@ class FeishuBitableManager:
                         return str(val)
 
                     all_memories.append({
-                        "category": flatten(fields.get("类别", "")),
-                        "name": flatten(fields.get("词条名", "")),
-                        "lore": flatten(fields.get("深层设定逻辑", "")),
-                        "visual_aura": flatten(fields.get("视觉氛围与美学隐喻", ""))
+                        "category": flatten(fields.get("类别", fields.get("Category", ""))),
+                        "name": flatten(fields.get("词条名", fields.get("名称", fields.get("Name", "")))),
+                        "aliases": [x.strip() for x in flatten(fields.get("代称标签", fields.get("代称", fields.get("Aliases", "")))).split(",") if x.strip()],
+                        "lore": flatten(fields.get("深层设定逻辑", fields.get("设定内容", fields.get("Lore", "")))),
+                        "visual_aura": flatten(fields.get("视觉氛围与美学隐喻", fields.get("视觉指纹", fields.get("Visual Aura", ""))))
                     })
                 page_token = data.get("page_token")
                 if not data.get("has_more"): break
@@ -223,6 +253,22 @@ class FeishuBitableManager:
 
     def insert_new_parsed_scenes(self, scenes_array, episode_start=1):
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/batch_create"
+        
+        valid_fields = self.get_table_field_names(APP_TOKEN_SCRIPT, TABLE_SCRIPT)
+        FIELD_MAPPING = {
+            "episode": ["集数/场次", "集数", "Episode"],
+            "text": ["小说原文（内容）", "小说原文", "Text"],
+            "status": ["状态", "Status"],
+            "desc": ["场景描述", "剧本拆解", "Description", "镜头详情"],
+            "visual": ["视觉提示词", "Visual Prompt", "视频提示词"],
+            "audio": ["音频提示词", "Audio Prompt", "语音提示词"]
+        }
+        def get_field(k):
+            if not valid_fields: return FIELD_MAPPING[k][0]
+            for c in FIELD_MAPPING[k]:
+                if c in valid_fields: return c
+            return None
+
         records = []
         for i, scene in enumerate(scenes_array):
             content_desc = scene.get("summary", "")
@@ -245,14 +291,15 @@ class FeishuBitableManager:
             audio_raw = scene.get("audio_plan", scene.get("audio_prompt", ""))
             audio_prompt = flatten_prompt(audio_raw)
             
-            records.append({"fields": {
-                "集数/场次": episode_start + i,
-                "小说原文（内容）": scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}"), 
-                "状态": ["待生成"],
-                "场景描述": f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}",
-                "视觉提示词": visual_prompt,
-                "音频提示词": audio_prompt
-            }})
+            fields = {}
+            if get_field("episode"): fields[get_field("episode")] = episode_start + i
+            if get_field("text"): fields[get_field("text")] = scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}")
+            if get_field("status"): fields[get_field("status")] = ["待生成"]
+            if get_field("desc"): fields[get_field("desc")] = f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}"
+            if get_field("visual"): fields[get_field("visual")] = visual_prompt
+            if get_field("audio"): fields[get_field("audio")] = audio_prompt
+            
+            records.append({"fields": fields})
         
         created_ids = []
         batch_size = 490

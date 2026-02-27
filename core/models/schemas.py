@@ -10,3 +10,6 @@ class NovelSubmission(BaseModel):
     content: str
     style: str = "anime"
     gateway: str = "seedance-1.5-pro"
+    llm_temperature: float = 0.7
+    top_p: float = 1.0
+    chunk_size: int = 1200

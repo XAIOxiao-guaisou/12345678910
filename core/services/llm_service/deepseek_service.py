@@ -75,7 +75,7 @@ STYLE_PRESETS = {
 class DeepSeekService:
     @staticmethod
     @retry(wait=wait_exponential(multiplier=1, min=4, max=60), stop=stop_after_attempt(5), retry=retry_if_exception(_is_requests_retryable))
-    def call_openai_compatible_api(base_url: str, api_key: str, model: str, message: str, timeout: int = 150):
+    def call_openai_compatible_api(base_url: str, api_key: str, model: str, message: str, timeout: int = 150, temperature: float = 0.7, top_p: float = 1.0):
         url = f"{base_url.rstrip('/')}/chat/completions"
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -88,7 +88,8 @@ class DeepSeekService:
                 {"role": "user", "content": message}
             ],
             "max_tokens": 4096,
-            "temperature": 0.7
+            "temperature": temperature,
+            "top_p": top_p
         }
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         resp.raise_for_status()
@@ -99,7 +100,7 @@ class DeepSeekService:
         return content
 
     @staticmethod
-    def call_deepseek(message: str):
+    def call_deepseek(message: str, temperature: float = 0.7, top_p: float = 1.0):
         """依次尝试各个免费反向代理调用 DeepSeek"""
         for proxy in FREE_PROXY_ENDPOINTS:
             model_map = proxy.get("model_map", {})
@@ -114,7 +115,9 @@ class DeepSeekService:
                     api_key=proxy["api_key"],
                     model=proxy_model,
                     message=message,
-                    timeout=120
+                    timeout=120,
+                    temperature=temperature,
+                    top_p=top_p
                 )
                 return content
             except Exception as e:
@@ -153,8 +156,17 @@ class DeepSeekService:
                     repaired = str(raw_json)[:int(last_brace)+1] + ']'
                     res = try_parse(repaired)
                     if res:
-                        logger.warning(f"✅ 修复了被截断的 JSON，成功挽救 {len(res)} 条分镜。")
+                        logger.warning(f"✅ 修复了被截断的 JSON (Missing ']')，成功挽救 {len(res)} 条分镜。")
                         return res
+                # Deep JSON Repair if missing brace completely
+                last_quote = raw_json.rfind('"')
+                if last_quote != -1 and raw_json.rfind('}') < last_quote:
+                    # Very abruptly ended
+                    repaired2 = str(raw_json)[:int(last_quote)] + '"}]'
+                    res2 = try_parse(repaired2)
+                    if res2:
+                        logger.warning(f"✅ 深度修复了严重截断的 JSON，成功挽救 {len(res2)} 条分镜。")
+                        return res2
         return None
 
     def smart_chunk_text(raw_text: str, chunk_size: int = 1200) -> list:
@@ -207,7 +219,7 @@ class DeepSeekService:
 请输出一段 JSON 数组，用于写入飞书【记忆中枢】表格。
 格式如下：
 [
-  {{"category": "类别(如世界观/地标/道具/角色)", "name": "词条名", "lore": "深层设定逻辑", "visual_aura": "你自主决定的视觉氛围与美学隐喻"}}
+  {{"category": "类别(如世界观/核心角色/地标/道具)", "name": "核心名字", "aliases": ["代称1", "尊称2", "他/她(如果是主角)"], "lore": "深层设定逻辑", "visual_aura": "你自主决定的视觉氛围与美学隐喻"}}
 ]
 
 小说原文：
@@ -228,9 +240,10 @@ class DeepSeekService:
         raise RuntimeError("阶段一建档失败！DeepSeek 未能正确返回 JSON 格式的记忆中枢数据，管线中断。")
 
     @staticmethod
-    def generate_scenes_for_chunk(chunk_text, memory_context_str):
+    def generate_scenes_for_chunk(chunk_text, memory_context_str, temperature: float = 0.7, top_p: float = 1.0):
         prompt = f"""# Role
-你是一位极具审美直觉的 AI 电影总导演。你不需要听从任何死板的摄影指令，你拥有完全的视听语言决定权。
+你是一位极具审美直觉的 AI 电影总导演。你正在将小说的内容转化为严格的分镜视频生成提词。
+你不需要听从任何死板的摄影指令，但必须严格遵循一致性协议和记忆库资产。
 
 【你的记忆空间】（由系统动态传入）：
 {memory_context_str}
@@ -238,29 +251,31 @@ class DeepSeekService:
 【当前待拍摄剧本】：
 {chunk_text}
 
-你的执导任务：
+你的执导任务与结构化协议：
 
-感知情绪：阅读剧本，结合你的【记忆空间】，自主感受这一幕的戏剧张力、角色的心理状态和环境的潜台词。
+1. 视觉指纹 (Visual Fingerprints)：你必须严格跟随【记忆空间】提供的视觉指纹。若剧本涉及已定义实体或角色，你的描述必须以其实体对应的 visual_aura 为核心逻辑进行延展。如果未定义，请根据全局世界观/氛围进行补充，但严禁引入与设定相悖的物理描述。
+   
+2. 动作连贯性协议 (Kinematic Continuity)：在多镜头描述中，确保角色动作具有空间连续性。禁止在 15 秒内的分镜中出现光影方向的突兀逆转或角色位置瞬移。参考【短期连续性记忆】保持机位和光线的基础逻辑。
 
-场面调度：根据你对情绪的理解，自主决定每一段 15 秒视频的呈现方式。什么时候该用宏大的远景展现孤独？什么时候该用压抑的特写展现恐惧？由你全权安排。
+3. 去主观化指令 (Objective Translation)：你的任务是『翻译』而非『创作』。将剧本的戏剧动作转化为高维度的符合视频模型理解的客观视觉物理量描述（如光影方向、构图层次、材质质感、动作轨迹），用充满电影感的语言替代死板的提示词堆砌。
 
-光影与质感：不要堆砌死板的相机参数。请用充满电影感和文学性的语言描述画面（如：“冰冷的晨光穿透百叶窗，空气中悬浮着不安的尘埃”）。阿里云万相模型极其擅长理解这种高维度的意境描述。
+4. 禁止私自衍生 (Anti-Hallucination)：绝对禁止为了增加“电影感”而私自添加未在【记忆空间】定义且与此段剧本无关的宏大背景、复杂群体或花哨道具。所有的视觉元素必须在此前记忆中枢的管控范围内，保持画面聚焦与视觉资产纯净度。
 
 输出规范 (严格 JSON 数组)：
-请将你的导演构思转化为以下结构的 JSON，以便制片系统（飞书多维表格）分配拍摄任务：
+请将你的构思转化为以下 JSON，以便制片系统分配任务：
 [
   {{
     "scene_num": 1,
-    "summary": "简述剧情逻辑",
-    "director_notes": "导演手记：简述你为什么选择这样拍，你的视听意图是什么（此项供人类制片人参考）",
-    "visual_prompt": "你自主撰写的高维画面描述（无需死板的摄影机术语，注重画面内容、情绪光影、质感、主体动作的流畅描述。适合直接输入给中文视频大模型 Wan2.6）",
-    "audio_prompt": "你构思的背景音景与台词"
+    "summary": "简要剧情逻辑与动作（承上启下）",
+    "director_notes": "导演手记：解释为何这样安排站位与光影，体现了何种情绪",
+    "visual_prompt": "高维电影感画面描述（必须包含主体的动作、环境光影、且无缝融合对应的 visual_aura。适合中文视频大模型 Wan2.6 直接读取）",
+    "audio_prompt": "背景音景与台词"
   }}
 ]
 """
         for _ in range(3):
             try:
-                result_text = DeepSeekService.call_deepseek(prompt)
+                result_text = DeepSeekService.call_deepseek(prompt, temperature=temperature, top_p=top_p)
                 logger.info(f"DeepSeek Two-Stage Stage 2 Output (Length: {len(result_text)}):\n{result_text[:500]}...")
                 parsed = DeepSeekService.extract_json_from_deepseek(result_text)
                 if isinstance(parsed, list) and len(parsed) > 0 and ("visual_prompt" in parsed[0] or "master_prompt" in parsed[0]):

@@ -19,19 +19,37 @@ async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
     logger.info(f"已接收 {len(prompt_list)} 个任务，加入后台队列 (账号: {task.account}, 模型: {task.gateway})")
     return {"status": "ok", "message": f"成功接收 {len(prompt_list)} 个视频生成任务"}
 
+from core.config import settings
+
+@router.get("/api/mock_status")
+async def mock_status():
+    return {"mock_mode": settings.MOCK_MODE}
+
 @router.post("/api/upload_novel")
 async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
     text = req.content.strip()
     account = req.account.strip()
     style = req.style
     gateway = req.gateway
+    
+    # New options
+    llm_temperature = req.llm_temperature
+    top_p = req.top_p
+    chunk_size = req.chunk_size
     if not text:
         return {"status": "error", "message": "文章内容为空！"}
     
     async def process_and_queue():
         try:
             # use asyncio.to_thread because process_novel_to_feishu has blocking requests and sleeps
-            res = await asyncio.to_thread(pipeline.process_novel_to_feishu, text, style_key=style)
+            res = await asyncio.to_thread(
+                pipeline.process_novel_to_feishu, 
+                text, 
+                style_key=style,
+                llm_temperature=llm_temperature,
+                top_p=top_p,
+                chunk_size=chunk_size
+            )
             if res.get("status") == "success" and res.get("prompts"):
                 prompts = res.get("prompts", [])
                 logger.info(f"✨ 拆解完成 (风格: {style})，获取到 {len(prompts)} 个分镜并写入飞书。")

@@ -19,75 +19,90 @@ async def process_single_task(feishu_manager, task, download_dir):
         feishu_manager.update_record(record_id, {"状态": ["生成中"]})
         logger.info(f"[Task {record_id}] 已锁定，准备使用网关 {gateway} 生成")
         
-        # 2. 提交任务
-        video_api = VideoServiceFactory.get_service(gateway)
-        task_id = await video_api.submit_task(prompt)
-        logger.info(f"[Task {record_id}] API 提交成功，任务 ID: {task_id}")
-        
-        # 3. 轮询状态
-        while True:
-            await asyncio.sleep(10) # 10s interval
-            status_info = await video_api.check_status(task_id)
-            status = status_info.get("status")
+        # 2. 判断是否开启 Mock 模式
+        if settings.MOCK_MODE:
+            logger.warning(f"🧪 [Task {record_id}] MOCK_MODE 已开启，跳过真实视频生成，模拟秒级完成！")
+            await asyncio.sleep(2)  # Simulate small delay
+            file_name = f"video_{record_id}_mock.mp4"
+            final_path = os.path.join(download_dir, file_name)
+            open(final_path, 'wb').close() # touch file
             
-            if status == "success":
-                video_url = status_info.get("video_url")
-                if not video_url:
-                    raise Exception("API 返回成功但未提供视频下载链接")
+            logger.info(f"[Task {record_id}] Mock 本地文件创建成功: {final_path}，准备直传飞书...")
+            gateway_display = f"{gateway} (MOCK 模拟)"
+            cost_estimate = "\n> **预估真实消耗:** 约 300 秒及对应模型算力"
+            
+        else:
+            # 原有的真实提交逻辑
+            video_api = VideoServiceFactory.get_service(gateway)
+            task_id = await video_api.submit_task(prompt)
+            logger.info(f"[Task {record_id}] API 提交成功，任务 ID: {task_id}")
+            
+            # 3. 轮询状态
+            while True:
+                await asyncio.sleep(10) # 10s interval
+                status_info = await video_api.check_status(task_id)
+                status = status_info.get("status")
                 
-                # 下载到本地
-                file_name = f"video_{record_id}.mp4"
-                file_path = os.path.join(download_dir, file_name)
-                final_path = await video_api.download_video(video_url, file_path)
-                
-                logger.info(f"[Task {record_id}] 下载本地成功: {final_path}，准备直传飞书...")
-                
-                # 4. 上传到飞书并闭环
-                success = feishu_manager.upload_attachment_and_update_record(record_id, final_path)
-                if success:
-                    logger.info(f"[Task {record_id}] 飞书打通完毕！✅")
+                if status == "success":
+                    video_url = status_info.get("video_url")
+                    if not video_url:
+                        raise Exception("API 返回成功但未提供视频下载链接")
                     
-                    # 5. 发送企业微信机器人通知
-                    if settings.WX_BOT_WEBHOOK:
-                        try:
-                            import requests
-                            from datetime import datetime
-                            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            msg = {
-                                "msgtype": "markdown",
-                                "markdown": {
-                                    "content": f"🎉 **视频生成完成**\n"
-                                               f"> **任务ID:** {record_id}\n"
-                                               f"> **保存时间:** {now}\n"
-                                               f"> **本地保存路径:** {file_path}\n"
-                                               f"> **文件名:** {file_name}\n"
-                                               f"> **通道:** {gateway}"
-                                }
-                            }
-                            resp = requests.post(settings.WX_BOT_WEBHOOK, json=msg, timeout=5)
-                            if resp.ok and resp.json().get("errcode") == 0:
-                                logger.info(f"[Task {record_id}] 企微通知发送成功！")
-                            else:
-                                logger.error(f"[Task {record_id}] 企微通知异常: {resp.text}")
-                        except Exception as e:
-                            logger.error(f"[Task {record_id}] 企微通知请求失败: {e}")
-
-                    # 6. 清理磁盘空间
-                    try:
-                        os.remove(final_path)
-                        logger.info(f"[Task {record_id}] 清理本地缓存成功: {final_path}")
-                    except Exception as e:
-                        logger.error(f"[Task {record_id}] 清理本地缓存失败: {e}")
+                    # 下载到本地
+                    file_name = f"video_{record_id}.mp4"
+                    file_path = os.path.join(download_dir, file_name)
+                    final_path = await video_api.download_video(video_url, file_path)
+                    
+                    logger.info(f"[Task {record_id}] 下载本地成功: {final_path}，准备直传飞书...")
+                    gateway_display = gateway
+                    cost_estimate = ""
+                    break
+                    
+                elif status == "failed":
+                    err = status_info.get("error", "未知生成错误")
+                    raise Exception(f"视频服务生成失败: {err}")
                 else:
-                    raise Exception("下载成功，但上传飞书作为附件时失败")
-                
-                break
-                
-            elif status == "failed":
-                err = status_info.get("error", "未知生成错误")
-                raise Exception(f"视频服务生成失败: {err}")
-            else:
-                logger.debug(f"[Task {record_id}] 正在生成中，请耐心等待...")
+                    logger.debug(f"[Task {record_id}] 正在生成中，请耐心等待...")
+                    
+        # 4. 上传到飞书并闭环
+        success = feishu_manager.upload_attachment_and_update_record(record_id, final_path)
+        if success:
+            logger.info(f"[Task {record_id}] 飞书打通完毕！✅")
+            
+            # 5. 发送企业微信机器人通知
+            if settings.WX_BOT_WEBHOOK:
+                try:
+                    import requests
+                    from datetime import datetime
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    msg = {
+                        "msgtype": "markdown",
+                        "markdown": {
+                            "content": f"🎉 **视频生成完成**\n"
+                                       f"> **任务ID:** {record_id}\n"
+                                       f"> **保存时间:** {now}\n"
+                                       f"> **本地保存路径:** {final_path}\n"
+                                       f"> **文件名:** {file_name}\n"
+                                       f"> **通道:** {gateway_display}"
+                                       f"{cost_estimate}"
+                        }
+                    }
+                    resp = requests.post(settings.WX_BOT_WEBHOOK, json=msg, timeout=5)
+                    if resp.ok and resp.json().get("errcode") == 0:
+                        logger.info(f"[Task {record_id}] 企微通知发送成功！")
+                    else:
+                        logger.error(f"[Task {record_id}] 企微通知异常: {resp.text}")
+                except Exception as e:
+                    logger.error(f"[Task {record_id}] 企微通知请求失败: {e}")
+
+            # 6. 清理磁盘空间
+            try:
+                os.remove(final_path)
+                logger.info(f"[Task {record_id}] 清理本地缓存成功: {final_path}")
+            except Exception as e:
+                logger.error(f"[Task {record_id}] 清理本地缓存失败: {e}")
+        else:
+            raise Exception("下载成功，但上传飞书作为附件时失败")
                 
     except Exception as e:
         logger.error(f"[Task {record_id}] 发生异常熔断: {e}")

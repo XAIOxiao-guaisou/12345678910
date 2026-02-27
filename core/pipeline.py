@@ -11,7 +11,7 @@ class PipelineOrchestrator:
     def __init__(self):
         self.bitable = FeishuBitableManager()
 
-    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime"):
+    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime", llm_temperature: float = 0.7, top_p: float = 1.0, chunk_size: int = 1200):
         logger.info(f"======== 开始小说全自动上云飞书 (DeepSeek, Style: {style_key}) ========")
         
         # 1. 彻底清空四张表
@@ -35,32 +35,56 @@ class PipelineOrchestrator:
         all_memories = self.bitable.get_all_memories()
 
         # 3. 阶段二：自主执导与分镜 (拆解)
-        chunks = DeepSeekService.smart_chunk_text(novel_text, 1000)
+        chunks = DeepSeekService.smart_chunk_text(novel_text, chunk_size)
         logger.info(f"📖 小说共 {len(novel_text)} 字，切分 {len(chunks)} 块执行拆解...")
         all_scenes = []
+        
+        temporal_summary_memory = ""
+        temporal_visual_memory = ""
         
         for idx, chunk in enumerate(chunks):
             logger.info(f"🧠 [正在分析 {idx+1}/{len(chunks)} 块...]")
             
-            # 关键词匹配机制：只提取当前 chunk_text 中出现过的记忆词条
+            # 关键词匹配机制：提取当前 chunk_text 中出现过的记忆词条（包含代名关联匹配）
             relevant_memories = []
             for mem in all_memories:
                 name = mem.get("name", "")
-                # 如果名字在文本中出现，或者是宏观的世界观/氛围设定（默认带入）
-                if name and name in chunk:
+                aliases = mem.get("aliases", [])
+                cat = mem.get("category", "")
+                # 如果是宏观的世界观/氛围设定，或者【核心角色/角色】，强制带入（全局注入）
+                if cat in ["世界观", "氛围", "基调", "角色", "核心角色", "主要角色", "核心地标"]:
                     relevant_memories.append(mem)
-                elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
+                # 否则要求名字或代称在文本中明确出现
+                elif name and name in chunk:
+                    relevant_memories.append(mem)
+                elif any(alias in chunk for alias in aliases if alias):
                     relevant_memories.append(mem)
             
             # 构建记忆文段
-            memory_context_str = "【全局世界观与当前段落相关的记忆词条】\n"
+            memory_context_str = "【全局世界观与当前段落高度相关的记忆资产库】\n"
             for rm in relevant_memories:
-                memory_context_str += f"- [{rm.get('category', '设定')}] {rm.get('name', '')}：{rm.get('lore', '')}\n  视觉隐喻：{rm.get('visual_aura', '')}\n"
+                alias_str = f"（代称/别名：{', '.join(rm.get('aliases', []))}）" if rm.get('aliases') else ""
+                memory_context_str += f"- [{rm.get('category', '设定')}] {rm.get('name', '')} {alias_str}：\n  核心设定：{rm.get('lore', '')}\n  视觉隐喻：{rm.get('visual_aura', '')}\n\n"
 
-            scenes = DeepSeekService.generate_scenes_for_chunk(chunk, memory_context_str)
+            if temporal_summary_memory or temporal_visual_memory:
+                memory_context_str += "\n【短期连续性记忆（承接上文）】\n"
+                if temporal_summary_memory:
+                    memory_context_str += f"- 前情提要: {temporal_summary_memory}\n"
+                if temporal_visual_memory:
+                    memory_context_str += f"- 上一首分镜视觉: {temporal_visual_memory}\n"
+
+            scenes = DeepSeekService.generate_scenes_for_chunk(
+                chunk, 
+                memory_context_str,
+                temperature=llm_temperature,
+                top_p=top_p
+            )
             if scenes:
                  all_scenes.extend(scenes)
                  logger.info(f"✅ 第{idx+1}块完成，累积分镜: {len(all_scenes)} 个")
+                 last_scene = scenes[-1]
+                 temporal_summary_memory = last_scene.get("summary", "")
+                 temporal_visual_memory = last_scene.get("visual_prompt", "")
             time.sleep(1)
             
         if not all_scenes:
