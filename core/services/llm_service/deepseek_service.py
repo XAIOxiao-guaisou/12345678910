@@ -211,6 +211,83 @@ class DeepSeekService:
         raise RuntimeError("阶段一建档失败！DeepSeek 未能正确返回 JSON 格式的记忆中枢数据，管线中断。")
 
     @staticmethod
+    def delta_extract_memory(chapter_text: str, existing_summary: str, novel_id: str = "") -> list:
+        """
+        v2.6.0 增量记忆提取。
+        DeepSeek 对比现有记忆库，输出 UPDATE / INSERT / ARCHIVE 三类指令。
+        返回符合 MemoryEngine.local_diff 格式的 list。
+        """
+        prompt = f"""你是一个小说世界观的「记忆分析将」，负责维护一个复杂长篇小说的设定词条库。
+
+【现有记忆库里对比摘要（请不要重復创建其中已有的词条）】：
+{existing_summary}
+
+【当前章节原文（待分析）】：
+{chapter_text[:3000]}
+
+任务：
+对比现有记忆库与当前章节，输出以下三类指令：
+1. UPDATE: 已有词条需要修正（如角色获得新能力、地点改变、设定补充）
+2. INSERT: 全新出现的词条（新角色、新地点、新道具）
+3. ARCHIVE: 该词条已在本章明确季退出剧情（如角色死亡、地点毾灯）
+
+注意事项：
+- 无变化的词条无需输出（不要沿用现有词条做无意义的 INSERT）
+- 每条输出必须包含 action 字段
+- entity_id 如已知就填写（来自现有库摘要），如不知则留空
+- 如无任何变化（章节未引入任何设定更新），则返回空数组 []
+
+输出格式（严格 JSON 数组）：
+[
+  {{
+    "action": "UPDATE",
+    "entity_id": "e_a1b2c3d4",
+    "novel_id": "{novel_id}",
+    "category": "角色",
+    "name": "角色名",
+    "lore": "更新后的深层设定",
+    "visual_aura": "视觉隐喻"
+  }},
+  {{
+    "action": "INSERT",
+    "entity_id": "",
+    "novel_id": "{novel_id}",
+    "category": "地标",
+    "name": "新地点",
+    "lore": "",
+    "visual_aura": ""
+  }},
+  {{
+    "action": "ARCHIVE",
+    "entity_id": "e_x1y2z3w4",
+    "novel_id": "{novel_id}",
+    "name": "已死亱角色",
+    "reason": "该角色在本章第12节死亡"
+  }}
+]
+"""
+        logger.info("DeepSeek 增量提取记忆差分...")
+        for attempt in range(3):
+            try:
+                result_text = DeepSeekService.call_deepseek(prompt)
+                parsed = DeepSeekService.extract_json_from_deepseek(result_text)
+                if isinstance(parsed, list):
+                    # 允许空数组（表示该章无设定变化）
+                    if len(parsed) == 0:
+                        logger.info("✅ [delta_extract] 该章节无设定变化，返回空列表")
+                        return []
+                    if "action" in parsed[0]:
+                        logger.info(f"✅ [delta_extract] 成功解析 {len(parsed)} 条变更指令")
+                        return parsed
+                logger.warning(f"[delta_extract] 第{attempt+1}次返回格式异常: {str(result_text)[:200]}")
+            except Exception as e:
+                logger.error(f"[delta_extract] 第{attempt+1}次异常: {e}")
+            import time as _t; _t.sleep(2)
+
+        logger.warning("⚠️ delta_extract_memory 全部失败，返回空列表（该章记忆不变）")
+        return []
+
+    @staticmethod
     def generate_scenes_for_chunk(chunk_text, memory_context_str):
         prompt = f"""# Role
 你是一位极具审美直觉的 AI 电影总导演。你不需要听从任何死板的摄影指令，你拥有完全的视听语言决定权。

@@ -1,0 +1,52 @@
+{# memory_delta_extract.j2 — 增量记忆提取 Prompt（有历史记忆时使用）#}
+你是一个小说世界观的「记忆分析将」，负责维护一个复杂长篇小说的设定词条库。
+
+【小说项目标识】：{{ novel_id }}
+【当前章节】：{{ chapter_name }}
+
+【现有记忆库摘要（请不要重复创建其中已有的词条）】：
+{{ existing_summary }}
+
+【当前章节原文（待分析）】：
+{{ chapter_text }}
+
+任务：
+对比现有记忆库与当前章节，输出以下三类指令：
+1. UPDATE: 已有词条需要修正（如角色获得新能力、地点改变、设定补充）
+2. INSERT: 全新出现的词条（新角色、新地点、新道具）
+3. ARCHIVE: 该词条已在本章明确季退出剧情（如角色死亡、地点毁灭）
+
+注意事项：
+- 无变化的词条无需输出（不要沿用现有词条做无意义的 INSERT）
+- 每条输出必须包含 action 字段
+- entity_id 如已知就填写（来自现有库摘要），如不知则留空
+- 如无任何变化（章节未引入任何设定更新），则返回空数组 []
+
+输出格式（严格 JSON 数组）：
+[
+  {
+    "action": "UPDATE",
+    "entity_id": "e_xxxx_001",
+    "novel_id": "{{ novel_id }}",
+    "category": "角色",
+    "name": "角色名",
+    "lore": "更新后的深层设定逻辑",
+    "visual_aura": "更新后的视觉隐喻"
+  },
+  {
+    "action": "INSERT",
+    "entity_id": "",
+    "novel_id": "{{ novel_id }}",
+    "category": "地标",
+    "name": "新地点名",
+    "lore": "设定逻辑",
+    "visual_aura": "视觉氛围描述"
+  },
+  {
+    "action": "ARCHIVE",
+    "entity_id": "e_xxxx_003",
+    "novel_id": "{{ novel_id }}",
+    "name": "已退场角色名",
+    "reason": "该角色在本章第X节死亡/退场原因"
+  }
+]

@@ -1,13 +1,20 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
-from core.models.schemas import TaskRequest, NovelSubmission
+from fastapi.responses import StreamingResponse
+from core.models.schemas import TaskRequest, NovelSubmission, BatchNovelSubmission
 from core.pipeline import PipelineOrchestrator
 import logging
 import asyncio
 import os
+import uuid
+import json
+import time
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 pipeline = PipelineOrchestrator()
+
+# 批量任务进度存储（task_id → 进度信息 Dict）
+_batch_tasks: dict = {}
 
 @router.post("/api/run")
 async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
@@ -19,7 +26,7 @@ async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
     logger.info(f"已接收 {len(prompt_list)} 个任务，加入后台队列 (账号: {task.account}, 模型: {task.gateway})")
     return {"status": "ok", "message": f"成功接收 {len(prompt_list)} 个视频生成任务"}
 
-from core.config import settings
+
 from core.services.video_service.defaults import SMART_PRESETS, GATEWAY_SPECS
 from core.services.video_service.factory import GATEWAY_REGISTRY
 from pydantic import ValidationError
@@ -112,33 +119,34 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
     if not text:
         return {"status": "error", "message": "文章内容为空！"}
     
+    # novel_id 传入 pipeline
+    novel_id = getattr(req, "novel_id", "") or ""
+
     async def process_and_queue():
         try:
-            # use asyncio.to_thread because process_novel_to_feishu has blocking requests and sleeps
             res = await asyncio.to_thread(
-                pipeline.process_novel_to_feishu, 
-                text, 
+                pipeline.process_novel_to_feishu,
+                text,
                 style_key=style,
                 llm_temperature=llm_temperature,
                 top_p=top_p,
                 chunk_size=chunk_size,
                 video_params=video_params,
                 gateway=gateway,
-                sandbox_mode=sandbox_mode
+                sandbox_mode=sandbox_mode,
+                novel_id=novel_id,
             )
             if res.get("status") == "success" and res.get("prompts"):
                 prompts = res.get("prompts", [])
                 logger.info(f"✨ 拆解完成 (风格: {style})，获取到 {len(prompts)} 个分镜并写入飞书。")
-                logger.info(f"✨ API 接口已快速释放，后台 Worker 守护进程接管分镜视频生成逻辑！")
-                # 核心改动：不再由 FastAPI 亲历亲为地直接生成视频
-                # await pipeline.run_video_generation(account, prompts, gateway=gateway)
+                logger.info("✨ API 接口已快速释放，后台 Worker 守护进程接管分镜视频生成逻辑！")
             else:
                 logger.error("❌ 拆解失败或没有获取到分镜。")
         except Exception as e:
             logger.error(f"DeepSeek 队列处理发生异常: {e}")
 
     background_tasks.add_task(process_and_queue)
-    logger.info(f"📚 已在后台开启【闪电解文】线程 (风格: {style}, 模型: {gateway})，文本长度：{len(text)}")
+    logger.info(f"📚 已在后台开启【闪电解文】线程 (风格: {style}, 模型: {gateway}, novel_id: {novel_id})，文本长度：{len(text)}")
     return {"status": "ok", "message": f"文章已交由 DeepSeek AI 处理（模式：{style}）并在成功后自动触发视频生成！"}
 
 @router.get("/api/logs")
@@ -258,3 +266,152 @@ async def reroute_sandbox(req: RerouteRequest):
         return {"status": "ok", "message": f"一键投产成功！已剥离沙盒标记并重新分配至 {found_gw} 的真实生成队列。"}
     except Exception as e:
         return {"status": "error", "message": f"飞书记录更新失败: {e}"}
+
+
+# =============================================================
+# v2.6.0: 批量媒务接口
+# =============================================================
+
+@router.post("/api/upload_novel_batch")
+async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: BackgroundTasks):
+    """
+    批量多文件上传入口。
+    返回 task_id 供前端轮询或订阅 SSE 流。
+    """
+    task_id = str(uuid.uuid4())
+    _batch_tasks[task_id] = {
+        "status": "queued",
+        "novel_id": req.novel_id,
+        "total_files": len(req.files),
+        "stage1_done": 0,
+        "stage2_done": 0,
+        "scenes": 0,
+        "failed_chapters": [],
+        "log": [],
+        "finished": False,
+    }
+
+    async def _run_batch():
+        task = _batch_tasks[task_id]
+        task["status"] = "running"
+
+        async def on_progress(stage, current, total, chapter_name, status):
+            if stage == "stage1":
+                task["stage1_done"] = current
+                if status not in ("success",):
+                    task["failed_chapters"].append(chapter_name)
+            task["log"].append({
+                "stage": stage,
+                "chapter": chapter_name,
+                "progress": f"{current}/{total}",
+                "status": status,
+                "ts": time.time()
+            })
+            # 限据 log 长度防内存溢出
+            if len(task["log"]) > 200:
+                task["log"] = task["log"][-200:]
+
+        try:
+            result = await pipeline.process_files_batch(
+                files=[f.dict() for f in req.files],
+                novel_id=req.novel_id,
+                style_key=req.style,
+                gateway=req.gateway,
+                video_params=req.video_params,
+                sandbox_mode=req.sandbox_mode,
+                chunk_size=req.chunk_size,
+                on_progress=on_progress,
+            )
+            task["status"] = result.get("status", "done")
+            task["scenes"] = result.get("scenes", 0)
+        except Exception as e:
+            logger.error(f"[批量任务] {task_id} 异常: {e}")
+            task["status"] = "error"
+            task["error"] = str(e)
+        finally:
+            task["finished"] = True
+
+    background_tasks.add_task(_run_batch)
+    logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={req.novel_id}, 文件数={len(req.files)}")
+    return {
+        "status": "ok",
+        "task_id": task_id,
+        "novel_id": req.novel_id,
+        "total_files": len(req.files),
+        "message": f"批量任务已入队，使用 task_id={task_id} 查询进度"
+    }
+
+
+@router.get("/api/batch_status/{task_id}")
+async def get_batch_status(task_id: str):
+    """返回批量任务当前的进度快照（键入式轮询）"""
+    task = _batch_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"task_id={task_id} 不存在或已过期")
+    return {
+        "task_id": task_id,
+        "status": task["status"],
+        "novel_id": task["novel_id"],
+        "total_files": task["total_files"],
+        "stage1_done": task["stage1_done"],
+        "scenes": task["scenes"],
+        "failed_chapters": task["failed_chapters"],
+        "finished": task["finished"],
+    }
+
+
+@router.get("/api/progress_stream/{task_id}")
+async def progress_stream(task_id: str):
+    """
+    SSE 实时进度流。
+    每有新日志条目就推送一条 SSE 事件。
+    心跳机制：每 15 秒发送一个注释行（: keep-alive），
+    防止浏览器因长时间无数据而误判断连接。
+    """
+    task = _batch_tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail=f"task_id={task_id} 不存在")
+
+    async def event_generator():
+        last_log_idx = 0
+        last_heartbeat = time.time()
+        HEARTBEAT_INTERVAL = 15  # 秒
+
+        while True:
+            now = time.time()
+            logs = task.get("log", [])
+
+            # 推送新日志条目
+            new_logs = logs[last_log_idx:]
+            for entry in new_logs:
+                data = json.dumps(entry, ensure_ascii=False)
+                yield f"data: {data}\n\n"
+                last_heartbeat = now  # 有数据发送，重置心跳计时
+            last_log_idx += len(new_logs)
+
+            # 心跳包：超过 15s 未发送任何数据就放心跳注释
+            if (now - last_heartbeat) >= HEARTBEAT_INTERVAL:
+                yield ": keep-alive\n\n"
+                last_heartbeat = now
+
+            # 任务完成，发送最终状态并关闭流
+            if task.get("finished"):
+                final = {
+                    "event": "done",
+                    "status": task["status"],
+                    "scenes": task["scenes"],
+                    "failed_chapters": task["failed_chapters"],
+                }
+                yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+                break
+
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 防止 Nginx 缓充
+        }
+    )
