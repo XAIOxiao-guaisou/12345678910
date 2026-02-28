@@ -28,7 +28,7 @@ class PipelineOrchestrator:
         except RuntimeError:
             return False
 
-    def process_novel_to_feishu(
+    async def process_novel_to_feishu(
         self,
         novel_text: str,
         style_key: str = "anime",
@@ -44,7 +44,7 @@ class PipelineOrchestrator:
         v2.6.0: 去除了清空操作，支持 novel_id 隔离。
         Stage1 接入 MemoryEngine.evolve_memory（增量模式）。
         """
-        import hashlib, asyncio as _aio
+        import hashlib
         if video_params is None:
             video_params = {}
 
@@ -67,18 +67,12 @@ class PipelineOrchestrator:
                 self.bitable.insert_memory_records(memory_data, novel_id=novel_id)
             else:
                 logger.info(f"🔄 已有 {len(existing)} 条现存记忆，由 MemoryEngine 处理增量演化")
-                loop = _aio.new_event_loop()
-                try:
-                    loop.run_until_complete(
-                        MemoryEngine.evolve_memory(
-                            novel_id=novel_id,
-                            chapter_text=novel_text,
-                            chapter_name="单文件输入",
-                            bitable=self.bitable,
-                        )
-                    )
-                finally:
-                    loop.close()
+                await MemoryEngine.evolve_memory(
+                    novel_id=novel_id,
+                    chapter_text=novel_text,
+                    chapter_name="单文件输入",
+                    bitable=self.bitable,
+                )
         except Exception as e:
             logger.error(f"❌ 阶段一严重错误: {e}")
             return {"status": "error", "message": str(e)}

@@ -34,7 +34,7 @@ from pydantic import ValidationError
 @router.get("/api/system_info")
 async def system_info():
     return {
-        "mock_mode": settings.MOCK_MODE,
+        "mock_mode": os.environ.get("MOCK_MODE", "False") == "True",
         "smart_presets": SMART_PRESETS,
         "capabilities": GATEWAY_SPECS
     }
@@ -42,7 +42,7 @@ async def system_info():
 # Keeping /api/mock_status for backward compatibility
 @router.get("/api/mock_status")
 async def mock_status():
-    return {"mock_mode": settings.MOCK_MODE}
+    return {"mock_mode": os.environ.get("MOCK_MODE", "False") == "True"}
 
 from core.models.schemas import UpdatePresetRequest
 
@@ -124,9 +124,8 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
 
     async def process_and_queue():
         try:
-            res = await asyncio.to_thread(
-                pipeline.process_novel_to_feishu,
-                text,
+            res = await pipeline.process_novel_to_feishu(
+                novel_text=text,
                 style_key=style,
                 llm_temperature=llm_temperature,
                 top_p=top_p,
@@ -145,7 +144,7 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
         except Exception as e:
             logger.error(f"DeepSeek 队列处理发生异常: {e}")
 
-    background_tasks.add_task(process_and_queue)
+    asyncio.create_task(process_and_queue())
     logger.info(f"📚 已在后台开启【闪电解文】线程 (风格: {style}, 模型: {gateway}, novel_id: {novel_id})，文本长度：{len(text)}")
     return {"status": "ok", "message": f"文章已交由 DeepSeek AI 处理（模式：{style}）并在成功后自动触发视频生成！"}
 
@@ -292,6 +291,7 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
     }
 
     async def _run_batch():
+        await asyncio.sleep(1)  # Allow HTTP response to flush before blocking event loop
         task = _batch_tasks[task_id]
         task["status"] = "running"
 
@@ -331,7 +331,7 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
         finally:
             task["finished"] = True
 
-    background_tasks.add_task(_run_batch)
+    asyncio.create_task(_run_batch())
     logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={req.novel_id}, 文件数={len(req.files)}")
     return {
         "status": "ok",
