@@ -110,7 +110,7 @@ class PipelineOrchestrator:
             
         # 4. 回填飞书
         logger.info("云端写入剧本拆解（两阶段生成）...")
-        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1)
+        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1, gateway=gateway)
 
         # 5. 阶段三：一致性审计与自闭环 (Stage 3)
         logger.info("执行阶段三：全量内容的一致性审计 (Stage 3)...")
@@ -129,6 +129,11 @@ class PipelineOrchestrator:
                         rid = scene_num_to_record_id[s_num]
                         logger.info(f"修正场景 {s_num}: {reason}")
                         field_name = "视觉提示词" if "视觉提示词" in table_schema else ("Visual Prompt" if "Visual Prompt" in table_schema else "视频提示词")
+                        # [Phase 6] Re-inject the gateway config tag so the LLM-patched prompt
+                        # still carries its routing information — critical anti-drift protection.
+                        if video_params is not None:
+                            updated_prompt = RenderProtocol.inject_render_config(updated_prompt, video_params, gateway)
+                            logger.info(f"✅ 场景 {s_num} 已重注网关标签 [{gateway}]")
                         self.bitable.update_record(rid, {field_name: updated_prompt, "异常日志": f"[Stage 3 审计修正] {reason}"})
             else:
                 logger.warning("插入记录数不匹配，跳过精准修正。")

@@ -20,16 +20,22 @@ async def process_single_task(feishu_manager, task, download_dir):
     
     from core.services.video_service.defaults import SMART_PRESETS
     
-    # [Auto-Detect Gateway Support]
-    # If the Feishu table lacks the '网关模型' field, 'gateway' defaults to seedance-1.5-pro.
-    # But the injected RenderProtocol tag inside the text contains the truth.
+    # [Phase 6] Gateway Trust Priority:
+    # Level 1: Physical Feishu column (set at task creation, immutable to LLM edits)
+    # Level 2: Text tag auto-detection (scan all gateways if Level 1 produced no tag match)
+    # Level 3: Safety fallback to standard preset
+    
+    if tag_found:
+        logger.info(f"[Task {record_id}] ✅ 网关标签识别成功 (Level 1 物理列 + 文本标签匹配): gateway={gateway}")
+    
+    # Level 2: Try smart detection across all known gateways if the current one's tag wasn't found
     if not tag_found:
         from core.services.video_service.factory import GATEWAY_REGISTRY
         for gw in GATEWAY_REGISTRY.keys():
             if gw == gateway: continue
             alt_prompt, alt_config, alt_found = RenderProtocol.extract_render_config(task["visual_prompt"], gw)
             if alt_found:
-                logger.info(f"🔄 [Task {record_id}] 智能网关对齐：从提示词标签中侦测到网关应为 '{gw}'，覆盖默认 '{gateway}'。")
+                logger.info(f"🔄 [Task {record_id}] Level 2 智能网关对齐：从提示词标签中侵测到网关应为 '{gw}'，覆盖物理列默认 '{gateway}'")
                 gateway = gw
                 prompt = alt_prompt
                 config = alt_config
@@ -37,7 +43,7 @@ async def process_single_task(feishu_manager, task, download_dir):
                 break
 
     if not tag_found:
-        logger.warning(f"🚨 [Task {record_id}] 网关-配置不匹配！请求网关为 '{gateway}'，但这可能已被中途修改/未获取专属配置。执行沙盒防护安全降级。")
+        logger.warning(f"🚨 [Task {record_id}] Level 3 Safety Fallback: 第1/2级均无效，网关为 '{gateway}'，使用标准预设预防漂移")
         config = SMART_PRESETS.get(gateway, {}).get("standard", {})
     
     try:

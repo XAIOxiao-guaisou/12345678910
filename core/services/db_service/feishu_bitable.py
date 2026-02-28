@@ -200,7 +200,7 @@ class FeishuBitableManager:
             logger.error(f"Error fetching memories: {e}")
             return []
 
-    def insert_new_parsed_scenes(self, scenes_array, episode_start=1):
+    def insert_new_parsed_scenes(self, scenes_array, episode_start=1, gateway: str = ""):
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/batch_create"
         
         valid_fields = self.get_table_field_names(APP_TOKEN_SCRIPT, TABLE_SCRIPT)
@@ -216,7 +216,7 @@ class FeishuBitableManager:
             content_desc = scene.get("summary", "")
             if "visual_logic" in scene:
                 logic = scene["visual_logic"]
-                visual_logic_text = f"【0-5s】{logic.get('shot_1_0_5s', '')}\n【5-10s】{logic.get('shot_2_5_10s', '')}\n【10-15s】{logic.get('shot_3_10_15s', '')}"
+                visual_logic_text = f"　20-5s、{logic.get('shot_1_0_5s', '')}　、《5-10s》{logic.get('shot_2_5_10s', '')}　、《10-15s》{logic.get('shot_3_10_15s', '')}"
             else:
                 visual_logic_text = scene.get("scene_desc", "")
                 
@@ -240,6 +240,9 @@ class FeishuBitableManager:
             if get_field("desc"): fields[get_field("desc")] = f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}"
             if get_field("visual"): fields[get_field("visual")] = visual_prompt
             if get_field("audio"): fields[get_field("audio")] = audio_prompt
+            # [Phase 6] Write the gateway as a physical dedicated column
+            if gateway and get_field("gateway"):
+                fields[get_field("gateway")] = gateway
             
             records.append({"fields": fields})
         
@@ -365,11 +368,23 @@ class FeishuBitableManager:
                         return v[0]
                     return v
 
+                # [Phase 6] Priority order for gateway determination:
+                # 1. Physical dedicated column (most reliable, unaffected by LLM overwrites)
+                # 2. Fallback to seedance-1.5-pro (temporary default until tag detection in worker)
+                GATEWAY_MAPPING = settings.FEISHU_FIELD_MAPPING_SCRIPT.get("gateway", [])
+                gateway_val = ""
+                for col_name in GATEWAY_MAPPING:
+                    raw = fields.get(col_name, "")
+                    if raw:
+                        gateway_val = unpack(raw)
+                        break
+                if not gateway_val:
+                    gateway_val = "seedance-1.5-pro"
+
                 tasks.append({
                     "record_id": item.get("record_id"),
                     "visual_prompt": unpack(fields.get("视觉提示词", "")),
-                    # The Gateway field can be specified dynamically later; assuming "seedance-1.5-pro" temporarily
-                    "video_model": unpack(fields.get("网关模型", "seedance-1.5-pro")) 
+                    "video_model": gateway_val
                 })
             return tasks
         except Exception as e:

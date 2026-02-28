@@ -33,7 +33,8 @@ class Settings:
         "status": ["状态", "Status"],
         "desc": ["场景描述", "剧本拆解", "Description", "镜头详情"],
         "visual": ["视觉提示词", "Visual Prompt", "视频提示词"],
-        "audio": ["音频提示词", "Audio Prompt", "语音提示词"]
+        "audio": ["音频提示词", "Audio Prompt", "语音提示词"],
+        "gateway": ["所属模型/网关", "网关模型", "Gateway", "模型"]
     }
 
     # 视频大模型配置
