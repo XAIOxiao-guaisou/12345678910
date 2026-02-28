@@ -39,7 +39,7 @@ REQUIRED_MEMORY_FIELDS = [
     "所属小说ID", "entity_id", "version", "last_update_chapter", "status"
 ]
 REQUIRED_SCRIPT_FIELDS = [
-    "集数/场次", "视觉提示词", "状态", "所属模型/网关", "章节处理状态", "所属章节文件名"
+    "集数/场次", "视觉提示词", "状态", "所属模型/网关", "章节处理状态", "所属章节文件名", "任务ID"
 ]
 
 class FeishuBitableManager:
@@ -587,7 +587,7 @@ class FeishuBitableManager:
             logger.error(f"Error fetching memories: {e}")
             return []
 
-    def insert_new_parsed_scenes(self, scenes_array, episode_start=1):
+    def insert_new_parsed_scenes(self, scenes_array, episode_start=1, task_id: str = ""):
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/batch_create"
         records = []
         for i, scene in enumerate(scenes_array):
@@ -611,14 +611,18 @@ class FeishuBitableManager:
             audio_raw = scene.get("audio_plan", scene.get("audio_prompt", ""))
             audio_prompt = flatten_prompt(audio_raw)
             
-            records.append({"fields": {
+            scene_fields = {
                 "集数/场次": episode_start + i,
                 "小说原文（内容）": scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}"), 
                 "状态": ["拆解中"],
                 "场景描述": f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}",
                 "视觉提示词": visual_prompt,
                 "音频提示词": audio_prompt
-            }})
+            }
+            if task_id:
+                scene_fields["任务ID"] = task_id
+            
+            records.append({"fields": scene_fields})
         
         created_ids = []
         batch_size = 490
@@ -658,3 +662,43 @@ class FeishuBitableManager:
                     total += len(resp.json().get("data", {}).get("records", []))
             except Exception: pass
         return total
+
+    def get_records_by_task_id(self, task_id: str) -> list:
+        """
+        通过 任务ID 精准召回该批次下的所有生成的剧本记录。
+        ⚠️ 这依赖于【剧本拆解表】中“任务ID”字段被设置为“文本”类型，并开启了属性检索(Indexing)。
+        """
+        if not task_id: return []
+        search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/search"
+        all_items = []
+        page_token = None
+        
+        while True:
+            payload = {
+                "page_size": 500,
+                "filter": {
+                    "conjunction": "and",
+                    "conditions": [
+                        {"field_name": "任务ID", "operator": "is", "value": [task_id]}
+                    ]
+                }
+            }
+            if page_token:
+                payload["page_token"] = page_token
+                
+            try:
+                resp = requests.post(search_url, headers=self._get_headers(), json=payload)
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+                items = data.get("items", [])
+                all_items.extend(items)
+                
+                page_token = data.get("page_token")
+                if not data.get("has_more"):
+                    break
+            except Exception as e:
+                logger.error(f"get_records_by_task_id 异常 ({task_id}): {e}")
+                break
+                
+        logger.info(f"🔎 [任务回溯] 任务 {task_id} 共找回 {len(all_items)} 个分镜")
+        return all_items

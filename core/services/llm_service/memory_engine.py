@@ -111,6 +111,11 @@ class MemoryEngine:
             if action == "UPDATE":
                 rec = existing.get(entity_id)
                 if rec:
+                    # 检查人类干预锁：如果飞书中状态被修改为“锁定”，则放弃 AI 的 UPDATE 提议
+                    if rec["fields"].get("status") == "锁定":
+                        logger.info(f"[local_diff] 🔒 UPDATE 跳过: 词条 '{name}' 已被人工锁定")
+                        continue
+                    
                     # version 自增
                     old_version = rec["fields"].get("version", 1)
                     feishu_fields["version"] = old_version + 1

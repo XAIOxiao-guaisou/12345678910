@@ -16,6 +16,36 @@ pipeline = PipelineOrchestrator()
 # 批量任务进度存储（task_id → 进度信息 Dict）
 _batch_tasks: dict = {}
 
+def get_batch_tasks_file():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs", "batch_tasks.json")
+
+def load_batch_tasks():
+    global _batch_tasks
+    filepath = get_batch_tasks_file()
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                _batch_tasks = json.load(f)
+            logger.info(f"✅ 从快照成功恢复了 {len(_batch_tasks)} 个批量任务记录")
+        except Exception as e:
+            logger.error(f"⚠️ 读取 batch_tasks.json 失败 (可能文件损坏)，内存状态归零: {e}")
+            _batch_tasks = {}
+
+def save_batch_tasks():
+    # 写入节流在调用侧做，这里提供原子化落盘
+    filepath = get_batch_tasks_file()
+    tmp_path = filepath + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_batch_tasks, f, ensure_ascii=False)
+        os.replace(tmp_path, filepath)
+    except Exception as e:
+        logger.error(f"保存 batch_tasks.json 失败: {e}")
+
+# 在模块加载时尝试恢复
+load_batch_tasks()
+
 @router.post("/api/run")
 async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
     prompt_list = [p for p in task.prompt.split('\n') if p.strip()]
@@ -295,7 +325,9 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
         task = _batch_tasks[task_id]
         task["status"] = "running"
 
+        _last_save_time = 0
         async def on_progress(stage, current, total, chapter_name, status):
+            nonlocal _last_save_time
             if stage == "stage1":
                 task["stage1_done"] = current
                 if status not in ("success",):
@@ -310,6 +342,12 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
             # 限据 log 长度防内存溢出
             if len(task["log"]) > 200:
                 task["log"] = task["log"][-200:]
+            
+            # 节流保存：至少间隔 3 秒，或是关键状态（报错）
+            now = time.time()
+            if status in ("error", "success") or (now - _last_save_time > 3):
+                save_batch_tasks()
+                _last_save_time = now
 
         try:
             result = await pipeline.process_files_batch(
@@ -321,6 +359,7 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
                 sandbox_mode=req.sandbox_mode,
                 chunk_size=req.chunk_size,
                 on_progress=on_progress,
+                task_id=task_id,
             )
             task["status"] = result.get("status", "done")
             task["scenes"] = result.get("scenes", 0)
@@ -330,6 +369,7 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
             task["error"] = str(e)
         finally:
             task["finished"] = True
+            save_batch_tasks()
 
     asyncio.create_task(_run_batch())
     logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={req.novel_id}, 文件数={len(req.files)}")
@@ -364,13 +404,39 @@ async def get_batch_status(task_id: str):
 async def progress_stream(task_id: str):
     """
     SSE 实时进度流。
-    每有新日志条目就推送一条 SSE 事件。
-    心跳机制：每 15 秒发送一个注释行（: keep-alive），
-    防止浏览器因长时间无数据而误判断连接。
+    如果遭遇服务端宕机，内存_batch_tasks丢失，则通过 AQL 查询飞书实现进度基线回捞。
     """
+    from fastapi.responses import StreamingResponse
+    import asyncio
     task = _batch_tasks.get(task_id)
+
+    # === [增强设计] 内存丢失时的飞书回捞机制 ===
     if not task:
-        raise HTTPException(status_code=404, detail=f"task_id={task_id} 不存在")
+        logger.warning(f"⚠️ [SSE] 内存未找到 task_id={task_id}，尝试从飞书回捞历史进度...")
+        try:
+            from core.services.db_service.feishu_bitable import FeishuBitableManager
+            feishu = FeishuBitableManager()
+            recovered_records = feishu.get_records_by_task_id(task_id)
+            if recovered_records:
+                logger.info(f"✅ 从飞书恢复了 {len(recovered_records)} 个分镜进度")
+                task = {
+                    "status": "done",
+                    "novel_id": "recovered_task",
+                    "total_files": -1,
+                    "stage1_done": -1,
+                    "stage2_done": -1,
+                    "scenes": len(recovered_records),
+                    "failed_chapters": [],
+                    "log": [{"stage": "recovered", "status": "success", "ts": time.time()}],
+                    "finished": True,
+                }
+            else:
+               raise HTTPException(status_code=404, detail=f"task_id={task_id} 内存与飞书均未找到记录")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"🔗 从飞书恢复进度失败: {e}")
+            raise HTTPException(status_code=500, detail="尝试从飞书回捞状态时引发异常")
 
     async def event_generator():
         last_log_idx = 0

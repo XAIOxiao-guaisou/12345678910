@@ -158,6 +158,7 @@ class PipelineOrchestrator:
         sandbox_mode: bool = True,
         chunk_size: int = 1000,
         on_progress=None,
+        task_id: str = "",
     ):
         """
         v2.6.0 批量文件处理入口。
@@ -244,7 +245,7 @@ class PipelineOrchestrator:
         for idx, scene in enumerate(all_scenes):
             scene["_episode"] = idx + 1
 
-        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1, gateway=gateway)
+        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1, task_id)
         logger.info(f"🎉 批量流水线完成: novel_id={novel_id}, 分镜={len(all_scenes)}, 写入={len(inserted_ids)}")
         return {
             "status": "success",

@@ -288,13 +288,29 @@ class DeepSeekService:
         return []
 
     @staticmethod
-    def generate_scenes_for_chunk(chunk_text, memory_context_str):
+    def generate_scenes_for_chunk(chunk_text, memory_context_str, previous_scene_summary: str = ""):
+        # === 长篇防 Token 爆炸：语义裁断 ===
+        clipped_prev_summary = ""
+        if previous_scene_summary:
+            text = previous_scene_summary.strip()
+            if len(text) > 300:
+                # 寻找最近的句号或换行跨位截断
+                cut_point = max(text.find("。", -300), text.find("\n", -300))
+                if cut_point != -1:
+                    clipped_prev_summary = text[cut_point:].strip()
+                else:
+                    clipped_prev_summary = text[-300:]
+            else:
+                clipped_prev_summary = text
+
+        prompt_prev = f"\n【前情提要（语义衔接参考）】：\n{clipped_prev_summary}\n" if clipped_prev_summary else ""
+
         prompt = f"""# Role
 你是一位极具审美直觉的 AI 电影总导演。你不需要听从任何死板的摄影指令，你拥有完全的视听语言决定权。
 
 【你的记忆空间】（由系统动态传入）：
 {memory_context_str}
-
+{prompt_prev}
 【当前待拍摄剧本】：
 {chunk_text}
 

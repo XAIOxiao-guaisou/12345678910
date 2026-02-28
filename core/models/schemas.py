@@ -63,9 +63,10 @@ class BatchNovelSubmission(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("novel_id 不能为空，请输入项目名称")
-        if not re.match(r'^[\w\u4e00-\u9fa5]{1,32}$', v):
+        # 更加严谨的安全过滤：仅允许中英文、数字、下划线及连字符
+        if not re.match(r'^[\w\u4e00-\u9fa5\-]{1,32}$', v):
             raise ValueError(
-                "novel_id 只允许中文、字母、数字、下划线，且不超过 32 字符"
+                "novel_id 含有非法字符。为保证路径安全，只允许中文、字母、数字、连字符与下划线，且不超过 32 字符"
             )
         return v
 

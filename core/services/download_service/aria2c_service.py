@@ -95,20 +95,21 @@ async def download(
 
     强制 abspath：Aria2c 是独立进程，相对路径会解析到其工作目录，而非 FastAPI 的工作目录。
     """
-    # ── 路径绝对化（核心安全保障）
-    base_dir = os.path.abspath(download_dir) if download_dir else _BASE_DOWNLOAD_DIR
-    os.makedirs(base_dir, exist_ok=True)
-
     # ── 文件名规范化：novel_id + 集数 + 时间戳防碰撞
     ts = int(time.time()) % 100000
     safe_id = (novel_id or "novel")[:16].replace(" ", "_")
     padded_ep = str(episode_num).zfill(3)
     out_filename = f"{safe_id}_{padded_ep}_{ts}.mp4"
 
+    # ── 绝对路径隔离（强制为每部小说建立独立下载集目录，并且规避特殊字符引起Aria报错）
+    base_dir = os.path.abspath(download_dir) if download_dir else _BASE_DOWNLOAD_DIR
+    target_dir = os.path.join(base_dir, safe_id)
+    os.makedirs(target_dir, exist_ok=True)
+
     options = {
-        "dir":      base_dir,      # 📌 必须是绝对路径
+        "dir":      target_dir,      # 📌必须是已创建的绝对路径
         "out":      out_filename,
-        "continue": "true",        # 断点续传
+        "continue": "true",          # 断点续传
         "max-connection-per-server": "4",
     }
 
@@ -172,13 +173,15 @@ async def fallback_download(
     当 Aria2c 不可用时，使用 aiohttp 流式下载（不支持断点续传）。
     路径规则与 download() 保持一致（绝对路径+规范文件名）。
     """
-    base_dir = os.path.abspath(download_dir) if download_dir else _BASE_DOWNLOAD_DIR
-    os.makedirs(base_dir, exist_ok=True)
     ts = int(time.time()) % 100000
     safe_id = (novel_id or "novel")[:16].replace(" ", "_")
     padded_ep = str(episode_num).zfill(3)
     out_filename = f"{safe_id}_{padded_ep}_{ts}.mp4"
-    file_path = os.path.join(base_dir, out_filename)
+
+    base_dir = os.path.abspath(download_dir) if download_dir else _BASE_DOWNLOAD_DIR
+    target_dir = os.path.join(base_dir, safe_id)
+    os.makedirs(target_dir, exist_ok=True)
+    file_path = os.path.join(target_dir, out_filename)
 
     logger.warning(f"[aiohttp fallback] 降级下载: {url} → {file_path}")
     try:
