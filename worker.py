@@ -5,6 +5,7 @@ import os
 from core.config import settings
 from core.services.db_service.feishu_bitable import FeishuBitableManager
 from core.services.video_service.factory import VideoServiceFactory
+from core.protocols.render_protocol import RenderProtocol
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("WorkerDaemon")
@@ -14,75 +15,102 @@ async def process_single_task(feishu_manager, task, download_dir):
     prompt = task["visual_prompt"]
     gateway = task["video_model"]
     
-    # Extract embedded JSON config if present
-    import re, json
-    config = {}
-    config_match = re.search(r'\[RENDER_CONFIG\](.*?)\[/RENDER_CONFIG\]', prompt, re.DOTALL)
-    if config_match:
-        try:
-            config = json.loads(config_match.group(1).strip())
-            prompt = re.sub(r'\n*\[RENDER_CONFIG\].*?\[/RENDER_CONFIG\]', '', prompt, flags=re.DOTALL).strip()
-        except:
-            logger.warning(f"未能解析附加参数 JSON: {config_match.group(1)}")
-            
+    # Extract embedded JSON config using RenderProtocol for the specific gateway
+    prompt, config, tag_found = RenderProtocol.extract_render_config(prompt, gateway)
+    
+    from core.services.video_service.defaults import SMART_PRESETS
+    
+    # [Auto-Detect Gateway Support]
+    # If the Feishu table lacks the '网关模型' field, 'gateway' defaults to seedance-1.5-pro.
+    # But the injected RenderProtocol tag inside the text contains the truth.
+    if not tag_found:
+        from core.services.video_service.factory import GATEWAY_REGISTRY
+        for gw in GATEWAY_REGISTRY.keys():
+            if gw == gateway: continue
+            alt_prompt, alt_config, alt_found = RenderProtocol.extract_render_config(task["visual_prompt"], gw)
+            if alt_found:
+                logger.info(f"🔄 [Task {record_id}] 智能网关对齐：从提示词标签中侦测到网关应为 '{gw}'，覆盖默认 '{gateway}'。")
+                gateway = gw
+                prompt = alt_prompt
+                config = alt_config
+                tag_found = True
+                break
 
+    if not tag_found:
+        logger.warning(f"🚨 [Task {record_id}] 网关-配置不匹配！请求网关为 '{gateway}'，但这可能已被中途修改/未获取专属配置。执行沙盒防护安全降级。")
+        config = SMART_PRESETS.get(gateway, {}).get("standard", {})
     
     try:
         # 1. 锁定状态 -> 生成中
         feishu_manager.update_record(record_id, {"状态": ["生成中"]})
         logger.info(f"[Task {record_id}] 已锁定，准备使用网关 {gateway} 生成")
         
-        # 2. 判断是否开启 Mock 模式
-        if settings.MOCK_MODE:
-            logger.warning(f"🧪 [Task {record_id}] MOCK_MODE 已开启，跳过真实视频生成，模拟秒级完成！")
-            logger.info(f"🧪 [Task {record_id}] Target API Payload (参数透传验证):\n> Render Prompt: {prompt}\n> Render Config: {json.dumps(config, indent=2)}")
+        # 2. 统一接口调度 (Adapter Pattern)
+        # 获取服务（如果在沙盒模式下，这会安全地返回我们的 MockVideoService）
+        video_api = VideoServiceFactory.get_service(gateway, config)
+        
+        # 抛出真实或虚拟的任务
+        task_id = await video_api.submit_task(prompt, **config)
+        logger.info(f"[Task {record_id}] API 提交成功 (Config Keys: {list(config.keys())})，任务 ID: {task_id}")
+        
+        # 3. 统一轮询状态
+        while True:
+            await asyncio.sleep(10) # 10s interval
+            status_info = await video_api.check_status(task_id)
+            status = status_info.get("status")
             
-            await asyncio.sleep(2)  # Simulate small delay
-            file_name = f"video_{record_id}_mock.mp4"
-            final_path = os.path.join(download_dir, file_name)
-            open(final_path, 'wb').close() # touch file
-            
-            logger.info(f"[Task {record_id}] Mock 本地文件创建成功: {final_path}，准备直传飞书...")
-            gateway_display = f"{gateway} (MOCK 模拟)"
-            cost_estimate = f"\n> **调度参数:** {json.dumps(config)}\n> **预估真实消耗:** 约 300 秒及对应模型算力"
-            
-        else:
-            # 原有的真实提交逻辑
-            video_api = VideoServiceFactory.get_service(gateway)
-            task_id = await video_api.submit_task(prompt, **config)
-            logger.info(f"[Task {record_id}] API 提交成功 (Config: {config})，任务 ID: {task_id}")
-            
-            # 3. 轮询状态
-            while True:
-                await asyncio.sleep(10) # 10s interval
-                status_info = await video_api.check_status(task_id)
-                status = status_info.get("status")
+            if status == "success":
+                video_url = status_info.get("video_url")
+                if not video_url:
+                    raise Exception("API 返回成功但未提供视频下载链接")
                 
-                if status == "success":
-                    video_url = status_info.get("video_url")
-                    if not video_url:
-                        raise Exception("API 返回成功但未提供视频下载链接")
+                # 下载到本地（Mock 服务会直接生成虚拟空文件并返回路径）
+                file_name = f"video_{record_id}.mp4"
+                file_path = os.path.join(download_dir, file_name)
+                final_path = await video_api.download_video(video_url, file_path)
+                
+                logger.info(f"[Task {record_id}] 下载本地成功: {final_path}，准备直传飞书...")
+                
+                # 判断当前是否处于Mock沙盒生命周期中
+                mock_data = status_info.get("mock_data")
+                cost_estimate = ""
+                gateway_display = gateway
+                
+                if mock_data:
+                    gateway_display = f"{gateway} (MOCK 模拟)"
+                    # 算力预估计算
+                    token_count = int(len(prompt) * 1.5)
+                    llm_cost = (token_count / 1000) * 0.002
+                    resolution = config.get("resolution", "720p")
+                    res_cost_map = {"480p": 0.8, "720p": 1.5, "1080p": 3.0} if gateway == "wan_2_6" else {"480p": 0.4, "720p": 0.7, "1080p": 1.5}
+                    per_sec_cost = res_cost_map.get(resolution, 1.0)
+                    video_sec = 5 # 假设视频生成 5 秒
+                    video_cost = per_sec_cost * video_sec
+                    total_est = llm_cost + video_cost
+                    import json
+                    cfg_str = json.dumps(config, ensure_ascii=False)
+                    cost_estimate = (f"\n> **调度参数:** {cfg_str}\n"
+                                     f"> **预估计费:** 视频 {video_sec}秒 ({resolution}), LLM 约 {token_count} Tokens.\n"
+                                     f"> **预估金额:** 约 ¥{total_est:.4f} (注：此为模拟金额，不计入实耗)")
                     
-                    # 下载到本地
-                    file_name = f"video_{record_id}.mp4"
-                    file_path = os.path.join(download_dir, file_name)
-                    final_path = await video_api.download_video(video_url, file_path)
+                    logger.info(f"🧪 [Task {record_id}] 沙盒模式跳过真实飞书附件上传，已模拟更新状态。")
                     
-                    logger.info(f"[Task {record_id}] 下载本地成功: {final_path}，准备直传飞书...")
-                    gateway_display = gateway
-                    cost_estimate = ""
-                    break
-                    
-                elif status == "failed":
-                    err = status_info.get("error", "未知生成错误")
-                    raise Exception(f"视频服务生成失败: {err}")
+                    # 补充用户需求: 视觉隔离沙盒数据
+                    feishu_manager.update_record(record_id, {"状态": ["已完成(Mock)", "待检查"], "异常日志": "[SANDBOX_TEST] 模拟计费与流程测试完成"})
+                    success = True
                 else:
-                    logger.debug(f"[Task {record_id}] 正在生成中，请耐心等待...")
-                    
-        # 4. 上传到飞书并闭环
-        success = feishu_manager.upload_attachment_and_update_record(record_id, final_path)
+                    success = feishu_manager.upload_attachment_and_update_record(record_id, final_path)
+                
+                break
+                
+            elif status == "failed":
+                err = status_info.get("error", "未知生成错误")
+                raise Exception(f"视频服务生成失败: {err}")
+            else:
+                logger.debug(f"[Task {record_id}] 正在生成中，请耐心等待...")
+                
         if success:
-            logger.info(f"[Task {record_id}] 飞书打通完毕！✅")
+            logger.info(f"[Task {record_id}] 飞书打通完毕/Mock已记录！✅")
             
             # 5. 发送企业微信机器人通知
             if settings.WX_BOT_WEBHOOK:
@@ -122,9 +150,10 @@ async def process_single_task(feishu_manager, task, download_dir):
     except Exception as e:
         logger.error(f"[Task {record_id}] 发生异常熔断: {e}")
         # 回填到飞书的额外字段 "异常日志"
+        err_prefix = "[SANDBOX_TEST] 模拟生成异常: " if config.get("_sandbox_mode") else ""
         feishu_manager.update_record(record_id, {
             "状态": ["生成异常"], 
-            "异常日志": str(e)
+            "异常日志": err_prefix + str(e)
         })
 
 async def worker_loop():

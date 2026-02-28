@@ -1,32 +1,48 @@
 from .volcengine_service import VolcengineVideoAPI
 from .aliyun_service import Wan2_6VideoAPI
+from core.models.gateways.wan26 import Wan26Params
+from core.models.gateways.seedance import SeedanceParams
 from core.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+# Registry linking UI specs, Schemas, and Service logic for each plugin gateway
+GATEWAY_REGISTRY = {
+    "wan_2_6": {
+        "service_class": Wan2_6VideoAPI,
+        "api_key_env": "ALIYUN_API_KEY",
+        "model_kwargs": {"model": "wan2.6-t2v"},
+        "schema": Wan26Params
+    },
+    "seedance-1.5-pro": {
+        "service_class": VolcengineVideoAPI,
+        "api_key_env": "VOLCENGINE_API_KEY",
+        "model_kwargs": {"model_id": "doubao-seedance-1-5-pro-251215"},
+        "schema": SeedanceParams
+    }
+}
 
 class VideoServiceFactory:
     @staticmethod
-    def get_service(gateway: str):
-        import logging
-        logger = logging.getLogger(__name__)
-        gateway_lower = gateway.lower()
-        
-        volc_valid = bool(settings.VOLCENGINE_API_KEY and "YOUR_" not in settings.VOLCENGINE_API_KEY)
-        aliyun_valid = bool(settings.ALIYUN_API_KEY and "YOUR_" not in settings.ALIYUN_API_KEY)
-
-        if "seedance" in gateway_lower or "volcengine" in gateway_lower or gateway == "API_MODE":
-            if volc_valid:
-                return VolcengineVideoAPI(api_key=settings.VOLCENGINE_API_KEY, model_id=gateway if gateway != "API_MODE" else "doubao-seedance-1-5-pro-251215")
-            elif aliyun_valid:
-                logger.warning(f"🔥 Volcengine 密钥未配置或无效。启动自动切换 -> 阿里云 Wan2.6")
-                return Wan2_6VideoAPI(api_key=settings.ALIYUN_API_KEY, model="wan2.6-t2v")
-            else:
-                raise ValueError("未配置有效的视频生成 API Key (Volcengine/Aliyun 均无效)")
-        elif "wan2.6" in gateway_lower or "aliyun" in gateway_lower:
-            if aliyun_valid:
-                return Wan2_6VideoAPI(api_key=settings.ALIYUN_API_KEY, model=gateway)
-            elif volc_valid:
-                logger.warning(f"🔥 阿里云 密钥未配置或无效。启动自动切换 -> Volcengine Seedance")
-                return VolcengineVideoAPI(api_key=settings.VOLCENGINE_API_KEY, model_id="doubao-seedance-1-5-pro-251215")
-            else:
-                raise ValueError("未配置有效的视频生成 API Key (Volcengine/Aliyun 均无效)")
-        else:
+    def get_service(gateway: str, config: dict = None):
+        if config is None:
+            config = {}
+            
+        if config.get("_sandbox_mode") is True:
+            from .mock_service import MockVideoService
+            return MockVideoService(gateway_name=gateway)
+            
+        registry_entry = GATEWAY_REGISTRY.get(gateway)
+        if not registry_entry:
             raise ValueError(f"不支持的网关: {gateway}")
+            
+        api_key_name = registry_entry["api_key_env"]
+        api_key = getattr(settings, api_key_name, "")
+        
+        if not api_key or "YOUR_" in api_key:
+            # Simplistic fallback check if one token is missing but user picked the wrong one can be implemented here
+            # For now, strict isolation enforces precise keys.
+            raise ValueError(f"未配置有效的视频生成 API Key for {gateway}, 请检查环境变量 {api_key_name}")
+            
+        return registry_entry["service_class"](api_key=api_key, **registry_entry["model_kwargs"])

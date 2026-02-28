@@ -121,15 +121,7 @@ class FeishuBitableManager:
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_MEMORY}/tables/{TABLE_MEMORY}/records/batch_create"
         
         valid_fields = self.get_table_field_names(APP_TOKEN_MEMORY, TABLE_MEMORY)
-        FIELD_MAPPING = {
-            "entity_id": ["实体标识符", "实体ID", "Entity ID", "entity_id"],
-            "lore": ["深层设定与逻辑", "深层设定逻辑", "设定内容", "Lore"],
-            "visual_constraints": ["视觉约束", "视觉排他性约束", "Visual Constraints", "视觉感官指纹"],
-            "dependencies": ["依赖关系", "Dependencies"],
-            "aliases": ["代称标签", "代称", "Aliases"],
-            "category": ["记忆维度", "类别", "Category"],
-            "name": ["词条名称", "词条名", "名称", "Name", "name"]
-        }
+        FIELD_MAPPING = settings.FEISHU_FIELD_MAPPING_MEMORY
         def get_field(k):
             if not valid_fields: return FIELD_MAPPING[k][0]
             for c in FIELD_MAPPING[k]:
@@ -212,14 +204,7 @@ class FeishuBitableManager:
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/batch_create"
         
         valid_fields = self.get_table_field_names(APP_TOKEN_SCRIPT, TABLE_SCRIPT)
-        FIELD_MAPPING = {
-            "episode": ["集数/场次", "集数", "Episode"],
-            "text": ["小说原文（内容）", "小说原文", "Text"],
-            "status": ["状态", "Status"],
-            "desc": ["场景描述", "剧本拆解", "Description", "镜头详情"],
-            "visual": ["视觉提示词", "Visual Prompt", "视频提示词"],
-            "audio": ["音频提示词", "Audio Prompt", "语音提示词"]
-        }
+        FIELD_MAPPING = settings.FEISHU_FIELD_MAPPING_SCRIPT
         def get_field(k):
             if not valid_fields: return FIELD_MAPPING[k][0]
             for c in FIELD_MAPPING[k]:
@@ -297,6 +282,17 @@ class FeishuBitableManager:
                     total += len(resp.json().get("data", {}).get("records", []))
             except Exception: pass
         return total
+
+    def get_record_by_id(self, record_id: str):
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/{record_id}"
+        try:
+            resp = requests.get(url, headers=self._get_headers())
+            if resp.ok and resp.json().get("code") == 0:
+                item = resp.json().get("data", {}).get("record", {})
+                return item.get("fields", {})
+        except Exception as e:
+            logger.error(f"Error fetching record {record_id}: {e}")
+        return {}
 
     def update_record(self, record_id: str, fields: dict):
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/{record_id}"

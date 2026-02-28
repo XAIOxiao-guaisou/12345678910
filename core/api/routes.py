@@ -20,10 +20,56 @@ async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
     return {"status": "ok", "message": f"成功接收 {len(prompt_list)} 个视频生成任务"}
 
 from core.config import settings
+from core.services.video_service.defaults import SMART_PRESETS, GATEWAY_SPECS
+from core.services.video_service.factory import GATEWAY_REGISTRY
+from pydantic import ValidationError
 
+@router.get("/api/system_info")
+async def system_info():
+    return {
+        "mock_mode": settings.MOCK_MODE,
+        "smart_presets": SMART_PRESETS,
+        "capabilities": GATEWAY_SPECS
+    }
+
+# Keeping /api/mock_status for backward compatibility
 @router.get("/api/mock_status")
 async def mock_status():
     return {"mock_mode": settings.MOCK_MODE}
+
+from core.models.schemas import UpdatePresetRequest
+
+@router.post("/api/update_presets")
+async def update_presets(req: UpdatePresetRequest):
+    gateway = req.gateway
+    preset_name = req.preset_name
+    params = req.video_params
+    
+    defaults_path = os.path.join(os.path.dirname(__file__), "..", "services", "video_service", "defaults.py")
+    defaults_path = os.path.abspath(defaults_path)
+    
+    try:
+        if gateway in SMART_PRESETS:
+            SMART_PRESETS[gateway][preset_name] = params
+            
+        with open(defaults_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        import re, json
+        new_dict_str = json.dumps(SMART_PRESETS, indent=4, ensure_ascii=False)
+        new_dict_str = new_dict_str.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+        
+        # Regex to match SMART_PRESETS dict safely
+        new_content = re.sub(r"SMART_PRESETS\s*=\s*\{.*?\}(?=\n[A-Z_]+\s*=|\Z)", f"SMART_PRESETS = {new_dict_str}", content, flags=re.DOTALL)
+        
+        with open(defaults_path, "w", encoding="utf-8") as f:
+            f.write(new_content)
+            
+        logger.info(f"✅ 成功将 {gateway} 的 {preset_name} 参数持久化为生产默认。")
+        return {"status": "ok", "message": "预设参数已全链路热更新成功"}
+    except Exception as e:
+        logger.error(f"持久化参数失败: {e}")
+        return {"status": "error", "message": str(e)}
 
 @router.post("/api/upload_novel")
 async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
@@ -32,11 +78,36 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
     style = req.style
     gateway = req.gateway
     
+    # Validate video_params via Pydantic Schema injection from Registry!
+    try:
+        registry_entry = GATEWAY_REGISTRY.get(gateway)
+        if not registry_entry:
+            return {"status": "error", "message": f"未知的网关模型: {gateway}"}
+            
+        SchemaClass = registry_entry["schema"]
+        # Inject gateway into the dict so Literal validation succeeds!
+        val_payload = req.video_params.copy()
+        val_payload["gateway"] = gateway
+        
+        validated_params = SchemaClass(**val_payload)
+        video_params = validated_params.dict(exclude_none=True, exclude={"gateway"})
+    except ValidationError as e:
+        logger.error(f"视频参数校验失败: {e}")
+        # Parse field-level specifics
+        errs = e.errors()
+        field_name = errs[0]['loc'][-1] if errs[0].get('loc') else "Unknown Field"
+        err_msg = errs[0]['msg']
+        return {
+            "status": "error", 
+            "message": f"[网关参数受阻] 发生拒止: {field_name} - {err_msg}",
+            "field_error": {"field": str(field_name), "reason": err_msg}
+        }
+        
     # New options
     llm_temperature = req.llm_temperature
     top_p = req.top_p
     chunk_size = req.chunk_size
-    video_params = req.video_params
+    sandbox_mode = req.sandbox_mode
     
     if not text:
         return {"status": "error", "message": "文章内容为空！"}
@@ -51,7 +122,9 @@ async def upload_novel(req: NovelSubmission, background_tasks: BackgroundTasks):
                 llm_temperature=llm_temperature,
                 top_p=top_p,
                 chunk_size=chunk_size,
-                video_params=video_params
+                video_params=video_params,
+                gateway=gateway,
+                sandbox_mode=sandbox_mode
             )
             if res.get("status") == "success" and res.get("prompts"):
                 prompts = res.get("prompts", [])
@@ -131,3 +204,57 @@ async def get_outputs():
         item["time_str"] = datetime.datetime.fromtimestamp(float(item["time"])).strftime('%m-%d %H:%M:%S')
         
     return {"files": files_info}
+
+from core.models.schemas import RerouteRequest
+from core.protocols.render_protocol import RenderProtocol
+from core.services.db_service.feishu_bitable import FeishuBitableManager
+
+@router.post("/api/reroute_sandbox")
+async def reroute_sandbox(req: RerouteRequest):
+    record_id = req.record_id
+    feishu = FeishuBitableManager()
+    fields = feishu.get_record_by_id(record_id)
+    if not fields:
+        return {"status": "error", "message": "无法找到该记录。"}
+        
+    def flatten(val):
+        if isinstance(val, str): return val
+        if isinstance(val, list): return "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in val)
+        return str(val)
+        
+    visual_raw = flatten(fields.get("视觉提示词", fields.get("Visual Prompt", fields.get("视频提示词", ""))))
+    if not visual_raw:
+        return {"status": "error", "message": "该记录缺少视觉提示词，无法进行一键投产。"}
+        
+    from core.services.video_service.factory import GATEWAY_REGISTRY
+    
+    found_config = None
+    found_gw = None
+    clean_prompt = visual_raw
+    
+    for gw in GATEWAY_REGISTRY.keys():
+        p, cfg, found = RenderProtocol.extract_render_config(visual_raw, gw)
+        if found:
+            clean_prompt = p
+            found_config = cfg
+            found_gw = gw
+            break
+            
+    if not found_gw:
+        return {"status": "error", "message": "未能在提示词中侦测到支持的网关配置，无法重新打包投产。"}
+        
+    if "_sandbox_mode" in found_config:
+        del found_config["_sandbox_mode"]
+        
+    new_prompt = RenderProtocol.inject_render_config(clean_prompt, found_config, found_gw)
+    field_name = "视觉提示词" if "视觉提示词" in fields else ("Visual Prompt" if "Visual Prompt" in fields else "视频提示词")
+    
+    try:
+        feishu.update_record(record_id, {
+            field_name: new_prompt,
+            "状态": ["待生成"],
+            "异常日志": "[System] 已一键将沙盒记录重组投产并进入队列"
+        })
+        return {"status": "ok", "message": f"一键投产成功！已剥离沙盒标记并重新分配至 {found_gw} 的真实生成队列。"}
+    except Exception as e:
+        return {"status": "error", "message": f"飞书记录更新失败: {e}"}

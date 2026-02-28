@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>AI 短剧全自动管线</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 20px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        textarea,
+        input,
+        select {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+
+        .slider-group {
+            display: flex;
+            align-items: center;
+        }
+
+        .slider-group input {
+            flex-grow: 1;
+            margin-right: 15px;
+        }
+
+        .slider-value {
+            width: 50px;
+            text-align: center;
+            font-weight: bold;
+            background: #f0f0f0;
+            padding: 5px;
+            border-radius: 4px;
+        }
+
+        /* Sandbox Switch */
+        .sandbox-toggle-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding: 12px 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border: 1px solid #dee2e6;
+            transition: all 0.3s ease;
+        }
+
+        .sandbox-toggle-container.sandbox-active {
+            background: #fff3cd;
+            border-color: #ffeeba;
+            box-shadow: 0 0 10px rgba(255, 193, 7, 0.3);
+        }
+
+        .sandbox-label {
+            font-weight: bold;
+            color: #495057;
+            display: flex;
+            align-items: center;
+        }
+
+        .sandbox-active .sandbox-label {
+            color: #856404;
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 26px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 18px;
+            width: 18px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked+.slider {
+            background-color: #ffc107;
+        }
+
+        input:checked+.slider:before {
+            transform: translateX(24px);
+        }
+
+        button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+            margin-top: 10px;
+            font-weight: bold;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            background: #eef;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            display: none;
+        }
+
+        .hint {
+            font-size: 0.8em;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .drag-over {
+            border: 2px dashed #007bff !important;
+            background-color: #f8fbff;
+        }
+
+        .textarea-wrapper {
+            position: relative;
+        }
+
+        .drop-hint {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            font-size: 0.8em;
+            color: #999;
+            pointer-events: none;
+        }
+
+        /* Advanced Panel Styles */
+        .advanced-panel {
+            background: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .advanced-header {
+            font-weight: bold;
+            font-size: 1.1em;
+            cursor: pointer;
+            user-select: none;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+            margin-bottom: 10px;
+        }
+
+        .advanced-content {
+            display: none;
+        }
+
+        .preset-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .preset-btn {
+            background: #e9ecef;
+            color: #333;
+            font-weight: normal;
+            font-size: 0.9em;
+            padding: 5px 10px;
+            margin: 0;
+            width: auto;
+        }
+
+        .preset-btn:hover {
+            background: #ced4da;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="sandboxContainer" class="sandbox-toggle-container">
+        <div class="sandbox-label">
+            <span class="sandbox-led" id="sandboxLed" style="display:none; margin-right: 8px;"></span>
+            <span id="sandboxText">🚀 生产模式 (计算将产生真实计费)</span>
+        </div>
+        <label class="switch">
+            <input type="checkbox" id="sandboxSwitch" onchange="toggleSandboxMode()">
+            <span class="slider"></span>
+        </label>
+    </div>
+    <h1>AI 短剧智能拆解流水线</h1>
+    <form id="uploadForm">
+        <div class="form-group">
+            <label for="account">账号 / ID</label>
+            <input type="text" id="account" required value="user_001">
+        </div>
+        <div class="form-group">
+            <label for="content">小说文本</label>
+            <div class="textarea-wrapper">
+                <textarea id="content" rows="10" required placeholder="在此输入或粘贴小说原文，也可直接将 .txt 文本文件拖拽至此处..."></textarea>
+                <span class="drop-hint">支持拖拽 .txt 文件 📄</span>
+            </div>
+        </div>
+        <div class="form-group">
+            <label for="style">视频质感风向</label>
+            <select id="style">
+                <option value="anime">高品质动漫</option>
+                <option value="realistic">电影感真人</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="gateway">视频大模型通道</label>
+            <select id="gateway">
+                <option value="seedance-1.5-pro">Volcengine (Seedance-1.5-Pro)</option>
+                <option value="wan_2_6">Aliyun (Wan2.6)</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label for="temperature">DeepSeek 创意度 / Temperature</label>
+            <div class="slider-group">
+                <input type="range" id="temperature" min="0" max="1.5" step="0.1" value="0.7"
+                    oninput="document.getElementById('tempVal').innerText = this.value">
+                <span id="tempVal" class="slider-value">0.7</span>
+            </div>
+            <div class="hint">较低值偏向忠实原著动作，较高值倾向导演自由发挥（建议 0.7）。</div>
+        </div>
+
+        <div class="form-group">
+            <label for="topp">Top P (发散广度)</label>
+            <div class="slider-group">
+                <input type="range" id="topp" min="0" max="1.0" step="0.1" value="1.0"
+                    oninput="document.getElementById('toppVal').innerText = this.value">
+                <span id="toppVal" class="slider-value">1.0</span>
+            </div>
+            <div class="hint">控制采样的概率质量，与创意度配合使用（1.0代表不限制）。</div>
+        </div>
+
+        <!-- 高级视频渲染调教面板 -->
+        <div class="advanced-panel">
+            <div class="advanced-header" onclick="toggleAdvanced()">
+                ⚙️ 视频渲染高级参数调校 (Video Tuning) <span>▼</span>
+            </div>
+            <div class="advanced-content" id="advancedContent">
+                <div class="preset-buttons">
+                    <button type="button" class="preset-btn" onclick="applyPreset('quick')">⚡ 快速原型</button>
+                    <button type="button" class="preset-btn" onclick="applyPreset('standard')">🎬 标准生成</button>
+                    <button type="button" class="preset-btn" onclick="applyPreset('cinematic')">👑 电影画质</button>
+                    <button type="button" class="preset-btn" id="syncProdBtn"
+                        style="display: none; background: #ffc107; font-weight: bold; margin-left: auto;"
+                        onclick="syncToProduction()">💾 保存为生产默认</button>
+                </div>
+
+                <div id="dynamicControlsContainer"></div>
+
+                <div class="form-group">
+                    <label for="seed">随机种子 (Seed，留空则随机)</label>
+                    <input type="number" id="seed" placeholder="例如: 42">
+                </div>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="chunk_size">单次处理切块大小 (Chunk Size)</label>
+            <input type="number" id="chunk_size" value="1200" step="100" min="500" max="4000">
+            <div class="hint">每块文字字数。设置太小会导致剧情不连贯，太大可能撑爆单次生成的上下文或丢失细节。</div>
+        </div>
+
+        <button type="submit">提交并触发全自动拆解生成</button>
+    </form>
+
+    <div id="result"></div>
+
+    <script>
+        let smartPresets = {};
+        let capabilities = {};
+        let isSandboxMode = false;
+
+        function toggleSandboxMode() {
+            const cb = document.getElementById('sandboxSwitch');
+            const container = document.getElementById('sandboxContainer');
+            const txt = document.getElementById('sandboxText');
+            const led = document.getElementById('sandboxLed');
+            const btn = document.querySelector('button[type="submit"]');
+            const syncBtn = document.getElementById('syncProdBtn');
+
+            isSandboxMode = cb.checked;
+
+            if (isSandboxMode) {
+                container.classList.add('sandbox-active');
+                txt.innerHTML = '🧪 <b>沙盒测试模式</b> (流程模拟，不消耗真实算力)';
+                led.style.display = 'inline-block';
+                btn.innerText = '提交任务 (沙盒测试)';
+                syncBtn.style.display = 'inline-block';
+            } else {
+                container.classList.remove('sandbox-active');
+                txt.innerHTML = '🚀 <b>生产模式</b> (计算将产生真实计费)';
+                led.style.display = 'none';
+                btn.innerText = '提交并触发真实生成';
+                syncBtn.style.display = 'none';
+            }
+        }
+
+        // Fetch System Info
+        fetch('/api/system_info')
+            .then(r => r.json())
+            .then(data => {
+                smartPresets = data.smart_presets || {};
+                capabilities = data.capabilities || {};
+
+                // Default switch based on server MOCK_MODE, though it's overrideable
+                if (data.mock_mode) {
+                    document.getElementById('sandboxSwitch').checked = true;
+                    toggleSandboxMode();
+                } else {
+                    toggleSandboxMode(); // Ensure correct btn text on start
+                }
+
+                // Initialize standard UI config
+                renderGatewayControls();
+            }).catch(e => console.log(e));
+
+        // When gateway changes, re-render DOM and apply standard preset
+        document.getElementById('gateway').addEventListener('change', () => {
+            renderGatewayControls();
+        });
+
+        function renderGatewayControls() {
+            const gateway = document.getElementById('gateway').value;
+            const container = document.getElementById('dynamicControlsContainer');
+            container.innerHTML = '';
+
+            if (!capabilities[gateway]) return;
+
+            const controls = capabilities[gateway].controls;
+            controls.forEach(ctrl => {
+                const group = document.createElement('div');
+                group.className = 'form-group';
+
+                if (ctrl.type === 'slider') {
+                    group.innerHTML = `
+                        <label for="${ctrl.field}" id="label_${ctrl.field}">${ctrl.label}</label>
+                        <div class="slider-group">
+                            <input type="range" class="dynamic-control" id="${ctrl.field}" min="${ctrl.min}" max="${ctrl.max}" step="${ctrl.step}" value="${ctrl.default}"
+                                oninput="document.getElementById('${ctrl.field}Val').innerText = this.value; if(typeof recalculateCost==='function') recalculateCost();">
+                            <span id="${ctrl.field}Val" class="slider-value">${ctrl.default}</span>
+                        </div>
+                    `;
+                } else if (ctrl.type === 'select') {
+                    let optionsHtml = ctrl.options.map(opt => `<option value="${opt}" ${opt === ctrl.default ? 'selected' : ''}>${opt}</option>`).join('');
+                    group.innerHTML = `
+                        <label for="${ctrl.field}" id="label_${ctrl.field}">${ctrl.label}</label>
+                        <select id="${ctrl.field}" class="dynamic-control" onchange="if(typeof recalculateCost==='function') recalculateCost();">
+                            ${optionsHtml}
+                        </select>
+                    `;
+                }
+                container.appendChild(group);
+            });
+
+            applyPreset('standard');
+        }
+
+        function recalculateCost() {
+            const costDisplay = document.getElementById('costDisplay') || createCostDisplay();
+            let steps = document.getElementById('sampling_steps') ? parseInt(document.getElementById('sampling_steps').value) : 50;
+            let res = document.getElementById('resolution') ? document.getElementById('resolution').value : '720p';
+
+            let resMultiplier = res === '1080p' ? 2.0 : (res === '480p' ? 0.5 : 1.0);
+            let stepMultiplier = steps / 50.0;
+            let totalMultiplier = (resMultiplier * stepMultiplier).toFixed(2);
+
+            costDisplay.innerHTML = `💡 <b>算力成本感知:</b> 相对基准生成约消耗 <span style="color:${totalMultiplier > 1.5 ? '#e74c3c' : '#27ae60'}; font-weight: bold">x${totalMultiplier}</span> 倍资源`;
+        }
+
+        function createCostDisplay() {
+            const div = document.createElement('div');
+            div.id = 'costDisplay';
+            div.style.marginTop = '10px';
+            div.style.fontSize = '0.9em';
+            div.style.padding = '8px';
+            div.style.backgroundColor = '#e8f4fd';
+            div.style.borderLeft = '4px solid #3498db';
+            div.style.borderRadius = '4px';
+            document.getElementById('advancedContent').appendChild(div);
+            return div;
+        }
+
+        // Drag and drop support for Textarea
+        const textarea = document.getElementById('content');
+
+        textarea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            textarea.classList.add('drag-over');
+        });
+
+        textarea.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            textarea.classList.remove('drag-over');
+        });
+
+        textarea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            textarea.classList.remove('drag-over');
+
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                const file = e.dataTransfer.files[0];
+                if (file.name.endsWith('.txt')) {
+                    const reader = new FileReader();
+                    reader.onload = function (event) {
+                        textarea.value = event.target.result;
+                    };
+                    reader.readAsText(file, 'utf-8'); // Assuming UTF-8 encoding
+                } else {
+                    alert('仅支持提取 .txt 格式的文本文件');
+                }
+            }
+        });
+
+        // Advanced Panel logic
+        function toggleAdvanced() {
+            const content = document.getElementById('advancedContent');
+            const headerBtn = document.querySelector('.advanced-header span');
+            if (content.style.display === 'block') {
+                content.style.display = 'none';
+                headerBtn.innerText = '▼';
+            } else {
+                content.style.display = 'block';
+                headerBtn.innerText = '▲';
+            }
+        }
+
+        function applyPreset(type) {
+            const gateway = document.getElementById('gateway').value;
+            if (!smartPresets[gateway] || !smartPresets[gateway][type]) return;
+
+            const preset = smartPresets[gateway][type];
+
+            // Loop over all keys and apply if DOM exists
+            for (const [key, val] of Object.entries(preset)) {
+                const el = document.getElementById(key);
+                if (el) {
+                    el.value = val;
+                    const valEl = document.getElementById(key + 'Val');
+                    if (valEl) valEl.innerText = val;
+                }
+            }
+            if (typeof recalculateCost === 'function') recalculateCost();
+        }
+
+        async function syncToProduction() {
+            if (!confirm("确定要将当前的高级参数保存为对应通道的【标准生成 (Standard)】生产默认值吗？下一次运行生产任务将直接使用此配置。")) return;
+
+            const btn = document.getElementById('syncProdBtn');
+            const originalText = btn.innerText;
+            btn.innerText = "正在保存...";
+            btn.disabled = true;
+
+            const gateway = document.getElementById('gateway').value;
+            const video_params = {};
+            document.querySelectorAll('.dynamic-control').forEach(el => {
+                video_params[el.id] = el.type === 'range' ? parseFloat(el.value) : el.value;
+            });
+
+            try {
+                const res = await fetch('/api/update_presets', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        gateway: gateway,
+                        preset_name: "standard",
+                        video_params: video_params
+                    })
+                });
+                const data = await res.json();
+                if (data.status === 'ok') {
+                    alert("✅ " + data.message);
+                    // Update frontend memory so we don't need to refresh
+                    if (!smartPresets[gateway]) smartPresets[gateway] = {};
+                    smartPresets[gateway]["standard"] = video_params;
+                } else {
+                    alert("❌ 保存失败: " + data.message);
+                }
+            } catch (e) {
+                alert("❌ 请求异常: " + e.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = e.target.querySelector('button');
+            const resultDiv = document.getElementById('result');
+
+            btn.disabled = true;
+            btn.innerText = "处理中，请查看控制台日志...";
+            resultDiv.style.display = 'none';
+            resultDiv.innerText = '';
+
+            // Recover all dynamic config controls safely into video dict
+            const video_params = {};
+            document.querySelectorAll('.dynamic-control').forEach(el => {
+                video_params[el.id] = el.type === 'range' ? parseFloat(el.value) : el.value;
+            });
+            const seedVal = document.getElementById('seed').value;
+            if (seedVal) video_params['seed'] = parseInt(seedVal);
+
+            // Reset red labels
+            document.querySelectorAll("[id^='label_']").forEach(l => {
+                l.innerHTML = l.innerHTML.replace(/<span.*span>/, '').trim();
+            });
+
+            const payload = {
+                account: document.getElementById('account').value,
+                content: document.getElementById('content').value,
+                style: document.getElementById('style').value,
+                gateway: document.getElementById('gateway').value,
+                llm_temperature: parseFloat(document.getElementById('temperature').value),
+                top_p: parseFloat(document.getElementById('topp').value),
+                chunk_size: parseInt(document.getElementById('chunk_size').value),
+                video_params: video_params,
+                sandbox_mode: isSandboxMode
+            };
+
+            try {
+                const response = await fetch('/api/upload_novel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await response.json();
+
+                // Catch field validation error gracefully
+                if (data.status === 'error' && data.field_error) {
+                    const fieldId = data.field_error.field;
+                    const label = document.getElementById('label_' + fieldId);
+                    if (label) {
+                        label.innerHTML = `${label.innerText} <span style="color:#e74c3c; font-weight:bold; font-size:12px;">⚠️ 拒止: ${data.field_error.reason}</span>`;
+                    }
+                }
+
+                resultDiv.style.display = 'block';
+                resultDiv.innerText = JSON.stringify(data, null, 2);
+                if (data.prompts && data.prompts.length > 0) {
+                    resultDiv.innerHTML += '<br><br><b>💡 阶段一记忆提取成功，阶段二正在后台剥离并注入队列...</b>';
+                }
+            } catch (error) {
+                resultDiv.style.display = 'block';
+                resultDiv.innerText = "请求失败: " + error.message;
+            } finally {
+                btn.disabled = false;
+                btn.innerText = isSandboxMode ? "提交任务 (沙盒测试)" : "提交并触发真实生成";
+            }
+        });
+    </script>
+</body>
+
+</html>

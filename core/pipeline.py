@@ -2,6 +2,7 @@ import asyncio
 import logging
 from core.services.llm_service.deepseek_service import DeepSeekService
 from core.services.db_service.feishu_bitable import FeishuBitableManager
+from core.protocols.render_protocol import RenderProtocol
 import time
 import os
 
@@ -11,8 +12,8 @@ class PipelineOrchestrator:
     def __init__(self):
         self.bitable = FeishuBitableManager()
 
-    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime", llm_temperature: float = 0.7, top_p: float = 1.0, chunk_size: int = 1200, video_params: dict = None):
-        logger.info(f"======== 开始小说全自动上云飞书 (DeepSeek, Style: {style_key}) ========")
+    def process_novel_to_feishu(self, novel_text: str, style_key: str = "anime", llm_temperature: float = 0.7, top_p: float = 1.0, chunk_size: int = 1200, video_params: dict = None, gateway: str = "seedance-1.5-pro", sandbox_mode: bool = False):
+        logger.info(f"======== 开始小说全自动上云飞书 (DeepSeek, Style: {style_key}, Sandbox: {sandbox_mode}) ========")
         
         # 1. 彻底清空工作表
         logger.info("清理历史积累表数据...")
@@ -23,7 +24,7 @@ class PipelineOrchestrator:
         # 2. 阶段一：记忆灌注与空间构建 (建档)
         logger.info("进入两阶段架构：阶段一 (构建记忆中枢)...")
         try:
-            memory_data = DeepSeekService.generate_memory_context(novel_text)
+            memory_data = DeepSeekService.generate_memory_context(novel_text, style_key=style_key)
             logger.info(f"✅ 记忆中枢提取完毕，获得 {len(memory_data)} 条设定。")
             self.bitable.insert_memory_records(memory_data)
         except Exception as e:
@@ -80,6 +81,7 @@ class PipelineOrchestrator:
             scenes = DeepSeekService.generate_scenes_for_chunk(
                 chunk, 
                 memory_context_str,
+                style_key=style_key,
                 temperature=llm_temperature,
                 top_p=top_p
             )
@@ -97,15 +99,14 @@ class PipelineOrchestrator:
             
         for idx, scene in enumerate(all_scenes):
             scene["_episode"] = idx + 1
-            if video_params:
-                import json
-                config_str = f"\n\n[RENDER_CONFIG]\n{json.dumps(video_params, ensure_ascii=False)}\n[/RENDER_CONFIG]"
+            if video_params is not None:
+                video_params["_sandbox_mode"] = sandbox_mode
                 if scene.get("master_prompt"):
-                    scene["master_prompt"] += config_str
+                    scene["master_prompt"] = RenderProtocol.inject_render_config(scene["master_prompt"], video_params, gateway)
                 elif scene.get("visual_prompt"):
-                    scene["visual_prompt"] += config_str
+                    scene["visual_prompt"] = RenderProtocol.inject_render_config(scene["visual_prompt"], video_params, gateway)
                 else:
-                    scene["visual_prompt"] = config_str
+                    scene["visual_prompt"] = RenderProtocol.inject_render_config("", video_params, gateway)
             
         # 4. 回填飞书
         logger.info("云端写入剧本拆解（两阶段生成）...")
@@ -114,7 +115,7 @@ class PipelineOrchestrator:
         # 5. 阶段三：一致性审计与自闭环 (Stage 3)
         logger.info("执行阶段三：全量内容的一致性审计 (Stage 3)...")
         import json
-        audit_result = DeepSeekService.consistency_audit(json.dumps(all_scenes, ensure_ascii=False), memory_context_str)
+        audit_result = DeepSeekService.consistency_audit(json.dumps(all_scenes, ensure_ascii=False), memory_context_str, style_key=style_key)
         fixes = audit_result.get("fixes", [])
         if fixes:
             logger.info(f"审计发现 {len(fixes)} 处断层或主观形容词，正在执行自动修正 (Patching Bitable)...")
