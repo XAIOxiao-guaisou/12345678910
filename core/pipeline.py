@@ -480,14 +480,15 @@ class PipelineOrchestrator:
         """
         logger.info(f"=== 开始 API 驱动视频生成流程 (Account: {account}, 模型: {gateway}) ===")
 
-        # 网关标识字符串 → DashScope/Volcengine 实际 model 名称映射
+        # 网关标识字符串 → DashScope 实际 model 名称映射
         GATEWAY_MODEL_MAP = {
-            "wan_2_6":       "wan2.6-t2v",        # 阿里云正式模型名
-            "wan2.6":        "wan2.6-t2v",
-            "wan2.6-t2v":    "wan2.6-t2v",
-            "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",  # 火山正式模型名
+            "wan_2_6":       "wan2.6-i2v",        # 阿里云 i2v（图生视频）— 默认
+            "wan2.6":        "wan2.6-i2v",
+            "wan2.6-i2v":    "wan2.6-i2v",
+            "wan2.6-t2v":    "wan2.6-t2v",        # 备用：文生视频
+            "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",
         }
-        api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)  # 未知网关透传原字符串
+        api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)
 
         # Dynamically load the correct class
         if "seedance" in gateway.lower() or "volcengine" in gateway.lower() or gateway == "API_MODE":
@@ -516,7 +517,10 @@ class PipelineOrchestrator:
             logger.error(f"不支持的网关模型类型: {gateway}")
             return
             
-        logger.info(f"收到 {len(prompts)} 个分镜，开始限流并行视频生成 (Semaphore=3, 间隔 2s)...")
+        logger.info(f"收到 {len(prompts)} 个分镜，开始限流并行视频生成 (Semaphore=3, 间隔 2s, 模型={api_model})...")
+        is_i2v = "i2v" in api_model.lower()
+        if is_i2v:
+            logger.info("🖼️ [Stage3] i2v 模式: 将从飞书素材表召回对应分镜的图片 URL")
 
         # 并发控制：Semaphore(3) 限制同时提交数
         submit_sem = asyncio.Semaphore(3)
@@ -525,9 +529,26 @@ class PipelineOrchestrator:
             async with submit_sem:
                 # 提交间隔 — 防止 QPS 这突破
                 await asyncio.sleep((idx - 1) * 2)
+
+                # i2v 模式：从飞书素材表查对应分镜的图片 URL
+                scene_image_url = ""
+                if is_i2v:
+                    try:
+                        # 尝试从分镜内嵌元数据提取 image_url
+                        if isinstance(prompt_text, tuple):
+                            prompt_text, scene_image_url = prompt_text
+                        if not scene_image_url:
+                            logger.warning(
+                                f"[Task {idx}] i2v 模式无 image_url，降级为文生视频"
+                            )
+                    except Exception:
+                        pass
                 for attempt in range(1, 4):  # 最多 3 次重试
                     try:
-                        task_id = await video_api.submit_task(prompt_text)
+                        task_id = await video_api.submit_task(
+                            prompt_text,
+                            image_url=scene_image_url  # i2v 传入，t2v/seedance 忽略
+                        )
                         logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
                         break
                     except Exception as e:
