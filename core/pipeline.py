@@ -479,21 +479,36 @@ class PipelineOrchestrator:
         this will use the configured Model API backend based on 'gateway'.
         """
         logger.info(f"=== 开始 API 驱动视频生成流程 (Account: {account}, 模型: {gateway}) ===")
+
+        # 网关标识字符串 → DashScope/Volcengine 实际 model 名称映射
+        GATEWAY_MODEL_MAP = {
+            "wan_2_6":       "wan2.6-t2v",        # 阿里云正式模型名
+            "wan2.6":        "wan2.6-t2v",
+            "wan2.6-t2v":    "wan2.6-t2v",
+            "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",  # 火山正式模型名
+        }
+        api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)  # 未知网关透传原字符串
+
         # Dynamically load the correct class
         if "seedance" in gateway.lower() or "volcengine" in gateway.lower() or gateway == "API_MODE":
             from core.services.video_service.volcengine_service import VolcengineVideoAPI
+            api_key = os.environ.get("VOLCENGINE_API_KEY", "")
+            if not api_key:
+                logger.error("❌ [VideoGen] VOLCENGINE_API_KEY 未配置，无法初始化火山引擎")
+                return
             try:
-                # In real prod this key should be an env var
-                api_key = os.environ.get("VOLCENGINE_API_KEY", "693c67a0-2b84-4e7c-afcd-7a2fb8f0134c")
-                video_api = VolcengineVideoAPI(api_key=api_key)
+                video_api = VolcengineVideoAPI(api_key=api_key, model_id=api_model)
             except Exception as e:
                 logger.error(f"无法初始化火山引擎 API 客户端: {e}")
                 return
         elif "wan2.6" in gateway.lower() or "wan_2_" in gateway.lower() or "aliyun" in gateway.lower():
             from core.services.video_service.aliyun_service import Wan2_6VideoAPI
+            aliyun_key = os.environ.get("ALIYUN_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
+            if not aliyun_key:
+                logger.error("❌ [VideoGen] ALIYUN_API_KEY 未配置，无法初始化阿里遗子 API")
+                return
             try:
-                # API Key will be read from OS env by default inside the class
-                video_api = Wan2_6VideoAPI(model=gateway)
+                video_api = Wan2_6VideoAPI(api_key=aliyun_key, model=api_model)
             except Exception as e:
                 logger.error(f"无法初始化阿里百炼 API 客户端: {e}")
                 return
