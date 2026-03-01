@@ -8,7 +8,6 @@ from core.services.llm_service.deepseek_service import DeepSeekService
 from core.services.db_service.feishu_bitable import FeishuBitableManager
 from core.services.llm_service.memory_engine import MemoryEngine
 from core.services.download_service.aria2c_service import Aria2cService
-from core.services.image_service.pollinations_service import PollinationsService
 from core.services.image_service.aliyun_image_service import AliyunImageService
 
 logger = logging.getLogger(__name__)
@@ -375,18 +374,8 @@ class PipelineOrchestrator:
         if not present_entities:
             return
 
-        # v2.7.1: 优先使用阿里云百炼 Wanx2.1（国内可达），Pollinations 作 fallback
-        aliyun_key = (
-            os.getenv("ALIYUN_API_KEY", "")
-            or os.getenv("DASHSCOPE_API_KEY", "")
-        )
-        if aliyun_key:
-            image_svc = AliyunImageService()
-            logger.info("🎨 [Stage1.5] 使用阿里云 Wanx2.1-t2i-turbo 生图")
-        else:
-            image_svc = PollinationsService()
-            logger.info("🎨 [Stage1.5] 使用 Pollinations.ai 生图（限国内网络）")
-
+        image_svc = AliyunImageService()   # qwen-image-plus via DashScope
+        logger.info("🎨 [Stage1.5] 使用阿里云 qwen-image-plus 生图")
         sem = asyncio.Semaphore(2)  # 防止并发过高限流
 
         async def _process_one(entity: dict):

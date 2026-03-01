@@ -1,8 +1,7 @@
 """
 aliyun_image_service.py — v2.7.1 阿里云百炼文生图服务
 
-使用 DashScope Wanx2.1 文生图模型替代 Pollinations.ai（后者在国内 530 封锁）。
-复用 .env 中已有的 ALIYUN_API_KEY。
+使用 qwen-image-plus 文生图模型，复用 .env 中已有的 ALIYUN_API_KEY。
 
 API 文档: https://help.aliyun.com/zh/model-studio/developer-reference/wanx-text-to-image
 接口: POST https://dashscope.aliyuncs.com/api/v1/services/aigc/text2image/image-synthesis
@@ -35,7 +34,7 @@ class AliyunImageService:
         "text2image/image-synthesis"
     )
     TASK_URL = "https://dashscope.aliyuncs.com/api/v1/tasks/{task_id}"
-    MODEL = "wanx2.1-t2i-turbo"
+    MODEL = "qwen-image-plus"
     MAX_POLL = 30       # 最多轮询 30 次（每次 3 秒 = 90 秒超时）
     POLL_INTERVAL = 3   # 秒
 
@@ -47,7 +46,7 @@ class AliyunImageService:
         if not self.api_key:
             logger.warning("⚠️ [AliyunImage] ALIYUN_API_KEY 未配置，文生图将失败")
         else:
-            logger.info("✅ [AliyunImage] API Key 已加载")
+            logger.info(f"✅ [AliyunImage] API Key 已加载，模型={self.MODEL}")
 
     def _headers(self) -> dict:
         return {
