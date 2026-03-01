@@ -1,5 +1,5 @@
 """
-memory_engine.py — v2.6.0 记忆进化引擎 (MemoryEngine)
+memory_engine.py — v2.6.5 记忆进化引擎 (MemoryEngine)
 
 核心职责:
   1. local_diff: 本地 O(1) 增量差分算法
@@ -62,6 +62,7 @@ class MemoryEngine:
             chapter_name: 当前处理章节名（用于历史字段）
         """
         result = {"update": [], "insert": [], "archive": []}
+        _present_entities: list = []  # v2.7.0: 收集本章实射实体
 
         for entry in new_entries:
             action = entry.get("action", "INSERT").upper()
@@ -129,6 +130,17 @@ class MemoryEngine:
                             if chapter_name not in new_trace_list:
                                 new_trace_list.append(chapter_name)
                             feishu_fields["章节轨迹"] = ",".join(new_trace_list)
+
+                        # v2.7.0: 登记本章实射实体（供 Stage 1.5）
+                        _present_entities.append({
+                            "entity_id": entity_id,
+                            "name": name,
+                            "category": entry.get("category", rec["fields"].get("category", "")),
+                            "lore": entry.get("lore", ""),
+                            "visual_aura": entry.get("visual_aura", rec["fields"].get("visual_aura", "")),
+                            "lore_changed": bool(entry.get("lore", "").strip()),  # 是否有设定变化
+                            "old_lore": rec["fields"].get("lore", ""),
+                        })
                         
                     else:
                         # 仅探测心跳，不用加 version
@@ -189,7 +201,19 @@ class MemoryEngine:
                     old_version = name_match["fields"].get("version", 1)
                     feishu_fields["version"] = old_version + 1
                     feishu_fields["status"] = "进化"
+                    # v2.6.5: 补全 last_seen / 章节轨迹（重名路径此前漏写，导致 trace 断链）
+                    feishu_fields["last_seen_chapter"] = chapter_name
+                    feishu_fields["last_seen_chapter_idx"] = chapter_index
                     if chapter_name:
+                        # 章节轨迹: 原子追加，严格去重
+                        old_trace = name_match["fields"].get("章节轨迹", "")
+                        if isinstance(old_trace, list):
+                            old_trace = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_trace)
+                        trace_list = [t.strip() for t in str(old_trace).split(",") if t.strip()] if old_trace else []
+                        if chapter_name not in trace_list:
+                            trace_list.append(chapter_name)
+                        feishu_fields["章节轨迹"] = ",".join(trace_list)
+                        # last_update_chapter
                         old_chap = name_match["fields"].get("last_update_chapter", "")
                         if isinstance(old_chap, list):
                             old_chap = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_chap)
@@ -197,10 +221,11 @@ class MemoryEngine:
                         if chapter_name not in existing_chapters:
                             existing_chapters.append(chapter_name)
                         feishu_fields["last_update_chapter"] = ";".join(existing_chapters)
+                        # 历史变更记录
                         old_log = name_match["fields"].get("历史变更记录", "")
                         if isinstance(old_log, list):
                             old_log = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_log)
-                        new_entry_log = f"[{chapter_name}] v{old_version+1}: 重名诏异INSERT转UPDATE"
+                        new_entry_log = f"[{chapter_name}] v{old_version+1}: 重名INSERT转UPDATE"
                         feishu_fields["历史变更记录"] = (old_log + "; " + new_entry_log).strip("; ") if old_log else new_entry_log
                     result["update"].append((name_match["record_id"], feishu_fields))
                 else:
@@ -215,11 +240,23 @@ class MemoryEngine:
                         feishu_fields["last_update_chapter"] = chapter_name
                         feishu_fields["历史变更记录"] = f"[{chapter_name}] v1: 新建"
                     result["insert"].append(feishu_fields)
+                    # v2.7.0: 新建实体也算本章实射（首次建档需要生成初始形象）
+                    _present_entities.append({
+                        "entity_id": entity_id,
+                        "name": name,
+                        "category": entry.get("category", ""),
+                        "lore": entry.get("lore", ""),
+                        "visual_aura": entry.get("visual_aura", ""),
+                        "lore_changed": True,  # 新建总算当作变化
+                        "old_lore": "",
+                    })
 
         logger.info(
             f"[local_diff] 差分结果: UPDATE={len(result['update'])} "
             f"INSERT={len(result['insert'])} ARCHIVE={len(result['archive'])}"
         )
+        # v2.7.0: 附带本章 present_in_current=True 的实体信息（供 Stage 1.5 消费）
+        result["present_entities"] = _present_entities
         return result
 
     # ------------------------------------------------------------------
@@ -385,4 +422,6 @@ class MemoryEngine:
             "inserted": len(insert_ids),
             "archived": archive_ok,
             "message": f"chapter={chapter_name} 演化完成",
+            # v2.7.0: 供 Stage 1.5 消费的本章实射实体列表
+            "stage1_entities": diff.get("present_entities", []),
         }

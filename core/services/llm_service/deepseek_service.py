@@ -4,6 +4,7 @@ import logging
 import json
 import re
 import os
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -354,3 +355,90 @@ class DeepSeekService:
                 pass
             time.sleep(2)
         return []
+
+    @staticmethod
+    def generate_visual_prompt(
+        entity: dict,
+        evolution_lore: str = "",
+        old_prompt: str = "",
+    ) -> str:
+        """
+        v2.7.0: 通用化实体视觉 Prompt 生成器。
+
+        Args:
+            entity:         包含 category/name/lore/visual_aura 的实体字典
+            evolution_lore: 本章视觉演进描述（空=初始建档，非空=迭代更新）
+            old_prompt:     上一章节确立的英文 Prompt（迭代时使用）
+
+        Returns:
+            str: 英文生图 Prompt（直接传给 PollinationsService）
+        """
+        # 尝试使用 Jinja2 模板，降级时用内置模板字符串
+        prompts_dir = Path(__file__).parent.parent.parent.parent / "prompts"
+        is_evolution = bool(evolution_lore.strip())
+        template_file = "visual_prompt_evolve.j2" if is_evolution else "visual_prompt_generate.j2"
+
+        prompt_text = ""
+        try:
+            from jinja2 import Environment, FileSystemLoader, StrictUndefined
+            env = Environment(
+                loader=FileSystemLoader(str(prompts_dir)),
+                undefined=StrictUndefined,
+                trim_blocks=True,
+                lstrip_blocks=True,
+            )
+            tpl = env.get_template(template_file)
+            ctx = {"entity": entity}
+            if is_evolution:
+                ctx["evolution_lore"] = evolution_lore
+                ctx["old_prompt"] = old_prompt
+            prompt_text = tpl.render(**ctx)
+        except Exception as e:
+            logger.warning(f"Jinja2 模板加载失败 ({template_file}): {e}，使用内置模板降级")
+            if is_evolution:
+                prompt_text = (
+                    f"You are a professional AI image director.\n"
+                    f"Base visual DNA (keep these unchanged): {old_prompt}\n"
+                    f"Visual evolution in this chapter: {evolution_lore}\n"
+                    f"Entity: {entity.get('name','')}, Category: {entity.get('category','')}\n"
+                    f"Generate updated English image prompt (comma-separated tags, 80-150 words). "
+                    f"Output ONLY the English prompt, no explanation."
+                )
+            else:
+                prompt_text = (
+                    f"You are a professional AI image director.\n"
+                    f"Entity: {entity.get('name','')}, Category: {entity.get('category','')}\n"
+                    f"Lore: {entity.get('lore','')}\n"
+                    f"Visual aura: {entity.get('visual_aura','')}\n"
+                    f"Generate an English image prompt (comma-separated tags, 80-150 words, "
+                    f"static visual elements only, end with masterpiece, best quality, highly detailed, 8k). "
+                    f"Output ONLY the English prompt, no explanation."
+                )
+
+        logger.info(f"🎨 [VisualPrompt] 生成 {'迭代' if is_evolution else '初始'} Prompt: {entity.get('name','')}")
+        for attempt in range(3):
+            try:
+                result = DeepSeekService.call_deepseek(prompt_text)
+                # 清理：去除 markdown 代码块包装，提取纯文本
+                result = result.strip()
+                if result.startswith("```"):
+                    lines = result.split("\n")
+                    result = "\n".join(
+                        l for l in lines
+                        if not l.strip().startswith("```")
+                    ).strip()
+                if result and len(result) > 20:
+                    logger.info(f"✅ [VisualPrompt] {entity.get('name','')} → {result[:80]}...")
+                    return result
+                logger.warning(f"[VisualPrompt] 第{attempt+1}次返回过短: {result[:50]}")
+            except Exception as e:
+                logger.error(f"[VisualPrompt] 第{attempt+1}次异常: {e}")
+            time.sleep(2)
+
+        # 降级：返回基于 visual_aura 的简单 Prompt
+        fallback = (
+            f"{entity.get('visual_aura', '')} {entity.get('lore', '')[:50]}, "
+            f"masterpiece, best quality, highly detailed, 8k"
+        ).strip(", ")
+        logger.warning(f"[VisualPrompt] 全部失败，使用降级 Prompt: {fallback[:60]}")
+        return fallback

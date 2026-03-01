@@ -1,28 +1,36 @@
-{# memory_delta_extract.j2 — 增量记忆提取 Prompt（有历史记忆时使用）#}
+{# memory_delta_extract.j2 — v2.6.5 增量记忆提取 Prompt（1+1 双轨制存续审计）#}
 你是一个小说世界观的「记忆分析将」，负责维护一个复杂长篇小说的设定词条库。
 
 【小说项目标识】：{{ novel_id }}
 【当前章节】：{{ chapter_name }}
 
-【现有记忆库摘要（请不要重复创建其中已有的词条）】：
+【当前全量活跃实体池（请逐一审视每个词条）】：
 {{ existing_summary }}
 
 【当前章节原文（待分析）】：
 {{ chapter_text }}
 
-任务：
-对比现有记忆库与当前章节，输出以下三类指令：
-1. UPDATE: 已有词条需要修正（如角色获得新能力、地点改变、设定补充）
-2. INSERT: 全新出现的词条（新角色、新地点、新道具）
-3. ARCHIVE: 该词条已在本章明确季退出剧情（如角色死亡、地点毁灭）
+## 核心任务（两轨并行，缺一不可）
 
-注意事项：
-- 无变化的词条无需输出（不要沿用现有词条做无意义的 INSERT）
-- 每条输出必须包含 action 字段
-- entity_id 如已知就填写（来自现有库摘要），如不知则留空
-- 如无任何变化（章节未引入任何设定更新），则返回空数组 []
+### 轨道 A — 存续状态审计（必须）
+你 **必须** 对上方「全量活跃实体池」中列出的 **每一个实体** 进行存续审计：
+- 只要该实体在本章有任何形式的出现（明示对话、侧面提及、场景背景），就输出 UPDATE 并标注 `"present_in_current": true`，同时写入其最新状态
+- 若该实体在本章 **完全未出场**，也必须输出 UPDATE 标注 `"present_in_current": false`，并在 `last_known_state` 中推演其合理的离场状态（如："留在驿站等候"）
+- **严禁漏掉任何一个活跃实体**，不审计 = 该实体心跳断线
 
-输出格式（严格 JSON 数组）：
+### 轨道 B — 新星探测（必须）
+检索本章出现的、**完全不在上方活跃实体池中**的全新高优先级实体（新角色/新地点/关键道具），输出 INSERT
+
+### 退场处理
+若某实体在本章明确死亡/永久退场，输出 ARCHIVE 并说明原因
+
+## 输出注意事项
+- `entity_id` 如已知就填写（来自现有库摘要），如不知则留空
+- 每条 UPDATE 必须携带 `present_in_current` 字段
+- 若活跃池为空，仅执行轨道 B
+- 输出严格 JSON 数组，不附加任何解释文字
+
+## 输出格式（严格 JSON 数组）
 [
   {
     "action": "UPDATE",
@@ -30,8 +38,21 @@
     "novel_id": "{{ novel_id }}",
     "category": "角色",
     "name": "角色名",
-    "lore": "更新后的深层设定逻辑",
-    "visual_aura": "更新后的视觉隐喻"
+    "lore": "更新后的深层设定逻辑（含本章新信息）",
+    "visual_aura": "更新后的视觉氛围描述",
+    "present_in_current": true,
+    "last_known_state": "该角色目前正站在城墙上眺望远方"
+  },
+  {
+    "action": "UPDATE",
+    "entity_id": "e_xxxx_002",
+    "novel_id": "{{ novel_id }}",
+    "category": "角色",
+    "name": "配角名（本章未出场）",
+    "lore": "（沿用旧设定，无变化）",
+    "visual_aura": "（沿用旧设定）",
+    "present_in_current": false,
+    "last_known_state": "推演：应在驿站中等候主角归来"
   },
   {
     "action": "INSERT",
@@ -40,13 +61,16 @@
     "category": "地标",
     "name": "新地点名",
     "lore": "设定逻辑",
-    "visual_aura": "视觉氛围描述"
+    "visual_aura": "视觉氛围描述",
+    "present_in_current": true,
+    "last_known_state": "新登场：主角刚刚进入此地"
   },
   {
     "action": "ARCHIVE",
     "entity_id": "e_xxxx_003",
     "novel_id": "{{ novel_id }}",
     "name": "已退场角色名",
-    "reason": "该角色在本章第X节死亡/退场原因"
+    "reason": "该角色在本章第X节死亡/退场原因",
+    "present_in_current": false
   }
 ]

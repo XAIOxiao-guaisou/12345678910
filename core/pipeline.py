@@ -8,6 +8,7 @@ from core.services.llm_service.deepseek_service import DeepSeekService
 from core.services.db_service.feishu_bitable import FeishuBitableManager
 from core.services.llm_service.memory_engine import MemoryEngine
 from core.services.download_service.aria2c_service import Aria2cService
+from core.services.image_service.pollinations_service import PollinationsService
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,15 @@ class PipelineOrchestrator:
             if result["status"] in ("success", "partial_error"):
                 self.bitable.mark_chapter_stage1_complete(novel_id, chapter_name)
 
+                # === Stage 1.5: 视觉锚定初始化（仅对 present_in_current=True 的实体）===
+                stage1_entities = result.get("stage1_entities", [])
+                if stage1_entities and not memory_lock:
+                    await self._run_stage1_5(
+                        novel_id=novel_id,
+                        chapter_name=chapter_name,
+                        present_entities=stage1_entities,
+                    )
+
         # === Stage2: 严格章节顺序串行 + 每章 Semaphore(3) 内并发 + 3次重试 ===
         # 章节顺序强保证: 1→N 一个不跳过，确保剧情发展不乱序
         all_memories_dict = self.bitable.get_memories_by_novel(novel_id)
@@ -322,6 +332,122 @@ class PipelineOrchestrator:
             "inserted": len(inserted_ids),
         }
     
+    async def _run_stage1_5(
+        self,
+        novel_id: str,
+        chapter_name: str,
+        present_entities: list,
+    ) -> None:
+        """
+        Stage 1.5: 视觉锚定初始化。
+
+        对本章 present_in_current=True 的实体列表进行三路判断：
+          A. 无图→ DeepSeek 生成英文 Prompt → Pollinations 生图 → 写入飞书
+          B. 有图 + lore 变化→ 迭代模式（保留旧 seed，新 evolution_lore）
+             同时将旧 visual_prompt 历史快照 按章节标签归档
+          C. 无变化→ 透传，跳过 API 调用
+        """
+        if not present_entities:
+            return
+
+        pollinations = PollinationsService()
+        sem = asyncio.Semaphore(2)  # 防止 Pollinations 限流
+
+        async def _process_one(entity: dict):
+            entity_id = entity["entity_id"]
+            entity_name = entity["name"]
+            asset_type = entity.get("category", "角色")
+            lore_changed = entity.get("lore_changed", False)
+
+            async with sem:
+                # 查询现有素材（不指定章节，取最新）
+                existing = await asyncio.to_thread(
+                    self.bitable.get_asset_by_entity, entity_id, novel_id
+                )
+
+                if existing.get("found") and not lore_changed:
+                    # 路径 C: 无变化，透传
+                    logger.info(
+                        f"⏩ [Stage1.5] {entity_name} 无视觉变化，透传现有素材"
+                    )
+                    return
+
+                old_prompt = existing.get("visual_prompt", "") if existing.get("found") else ""
+                old_seed = existing.get("seed", None) if existing.get("found") else None
+                is_evolution = existing.get("found") and lore_changed
+
+                # 生成 evolution_lore 描述（用于迭代模式）
+                evolution_lore = ""
+                if is_evolution:
+                    new_lore = entity.get("lore", "")
+                    old_lore = entity.get("old_lore", "")
+                    if new_lore and old_lore and new_lore != old_lore:
+                        evolution_lore = f"本章视觉变化：{new_lore[:200]}"
+                    elif new_lore:
+                        evolution_lore = f"本章新增设定：{new_lore[:200]}"
+
+                # DeepSeek 生成英文 Prompt
+                visual_prompt = await asyncio.to_thread(
+                    DeepSeekService.generate_visual_prompt,
+                    entity,
+                    evolution_lore,
+                    old_prompt,
+                )
+
+                if not visual_prompt:
+                    logger.warning(f"⚠️ [Stage1.5] {entity_name} Prompt 生成失败，跳过")
+                    return
+
+                # Pollinations 生图（迭代时复用旧 seed）
+                if is_evolution and old_seed:
+                    img_result = await pollinations.evolve_image(
+                        original_seed=old_seed,
+                        evolution_prompt=visual_prompt,
+                    )
+                else:
+                    img_result = await pollinations.generate_image(
+                        prompt=visual_prompt,
+                    )
+
+                if img_result.get("status") != "success":
+                    logger.error(
+                        f"❌ [Stage1.5] {entity_name} 生图失败: {img_result.get('error')}"
+                    )
+                    return
+
+                image_url = img_result["url"]
+                seed = img_result["seed"]
+
+                # 写入飞书素材表（版本化，旧 prompt 自动归档进历史快照）
+                await asyncio.to_thread(
+                    self.bitable.upsert_asset_record,
+                    novel_id=novel_id,
+                    entity_id=entity_id,
+                    entity_name=entity_name,
+                    asset_type=asset_type,
+                    visual_prompt=visual_prompt,
+                    image_url=image_url,
+                    seed=seed,
+                    chapter_tag=chapter_name,
+                    is_evolution=is_evolution,
+                    old_visual_prompt=old_prompt,
+                )
+
+                logger.info(
+                    f"✅ [Stage1.5] {entity_name} @{chapter_name} "
+                    f"{'[EVOLVE]' if is_evolution else '[INIT]'} 完成"
+                )
+
+        # 并发处理本章所有实体
+        tasks = [_process_one(e) for e in present_entities]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        errs = [r for r in results if isinstance(r, Exception)]
+        if errs:
+            logger.warning(f"⚠️ [Stage1.5] {len(errs)} 个实体处理异常: {errs[0]}")
+        logger.info(
+            f"🎬 [Stage1.5] 章节={chapter_name} 共处理 {len(present_entities)} 个实体"
+        )
+
     async def run_video_generation(self, account: str, prompts: list, gateway: str = "seedance-1.5-pro"):
         """
         Since we moved away from Playwright and to API-driven interfaces,

@@ -46,6 +46,11 @@ REQUIRED_SCRIPT_FIELDS = [
     "章节处理状态", "所属章节文件名", "任务ID", "关联记忆实体", "环境标签",
     "所属小说ID", "小说原文（内容）", "场景描述"
 ]
+# v2.7.0: 素材生成表（视觉锚定系统）
+REQUIRED_FACTORY_FIELDS = [
+    "所属小说ID", "entity_id", "素材类型", "视觉描述（英文Prompt）",
+    "图片URL", "Seed值", "章节标签", "生成状态", "历史快照"
+]
 
 class FeishuBitableManager:
     def __init__(self):
@@ -129,10 +134,30 @@ class FeishuBitableManager:
     # =======================================================
     # 空白行检测（优先填入而非追加）
     # =======================================================
+    @staticmethod
+    def _is_record_truly_empty(record: dict) -> bool:
+        """
+        本地二次校验：对服务端 AQL `isEmpty` 返回的候选行做精确验证。
+        飞书富文本字段 `isEmpty` 有时会将「含格式但无文本」的单元格漏过，
+        此处通过 flatten 文本后 strip 来最终确认是否真正为空白行。
+        """
+        fields = record.get("fields", {})
+        for key in ("视觉提示词", "小说原文（内容）"):
+            val = fields.get(key, "")
+            if isinstance(val, list):
+                val = "".join(
+                    seg.get("text", "") if isinstance(seg, dict) else str(seg)
+                    for seg in val
+                )
+            if str(val).strip():
+                return False
+        return True
+
     def _get_blank_record_ids(self, app_token: str, table_id: str) -> list:
         """
-        利用飞书 API 原生多条件过滤寻找核心业务字段全为空的记录。
-        服务端 AQL 检索，耗时 O(1)。
+        双重保险空白行检索：
+        ① 服务端 AQL `isEmpty` JSON filter 快速过滤（O(1)）
+        ② 本地 `_is_record_truly_empty` 二次锁定，排除飞书富文本误判
         """
         search_url = (
             f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}"
@@ -157,13 +182,20 @@ class FeishuBitableManager:
                 resp = requests.post(search_url, headers=self._get_headers(), json=payload)
                 resp.raise_for_status()
                 data = resp.json().get("data", {})
-                blank_ids.extend(r["record_id"] for r in data.get("items", []))
+                # 二次本地校验：过滤掉 AQL 误判的「假空行」
+                candidates = data.get("items", [])
+                server_count = len(candidates)
+                truly_blank = [r for r in candidates if self._is_record_truly_empty(r)]
+                filtered_out = server_count - len(truly_blank)
+                if filtered_out > 0:
+                    logger.info(f"🔍 [空白行二次校验] 服务端返回 {server_count} 条，本地过滤掉 {filtered_out} 条假空行")
+                blank_ids.extend(r["record_id"] for r in truly_blank)
                 page_token = data.get("page_token")
                 if not data.get("has_more"):
                     break
         except Exception as e:
             logger.warning(f"_get_blank_record_ids 扫描失败（降级为纯创建模式）: {e}")
-        logger.info(f"📋 [空白行服务端搜索] 发现 {len(blank_ids)} 个可填入空行 (O(1) 检索完成)")
+        logger.info(f"📋 [空白行双重检索] 最终确认 {len(blank_ids)} 个真·空白行")
         return blank_ids
 
     # =======================================================
@@ -356,6 +388,7 @@ class FeishuBitableManager:
         checks = [
             (APP_TOKEN_MEMORY, TABLE_MEMORY, "记忆中枢", REQUIRED_MEMORY_FIELDS),
             (APP_TOKEN_SCRIPT, TABLE_SCRIPT, "剧本拆解表", REQUIRED_SCRIPT_FIELDS),
+            (APP_TOKEN_FACTORY, TABLE_FACTORY, "素材生成表", REQUIRED_FACTORY_FIELDS),
         ]
         # 字段类型映射
         field_type_map = {
@@ -1007,3 +1040,242 @@ class FeishuBitableManager:
                 
         logger.info(f"🔎 [任务回溯] 任务 {task_id} 共找回 {len(all_items)} 个分镜")
         return all_items
+
+    # =======================================================
+    # v2.7.0: 素材生成表（视觉锚定系统）
+    # =======================================================
+    def get_asset_by_entity(
+        self, entity_id: str, novel_id: str, chapter_tag: str = ""
+    ) -> dict:
+        """
+        召回指定实体的最新视觉素材记录。
+        chapter_tag 不为空时，精准召回该章节的历史快照版本。
+
+        返回格式:
+        {
+            "record_id": str,
+            "image_url": str,
+            "seed": int,
+            "visual_prompt": str,   # 英文 Prompt（用于迭代参考）
+            "chapter_tag": str,     # 关联章节标签
+            "found": bool
+        }
+        """
+        search_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_FACTORY}"
+            f"/tables/{TABLE_FACTORY}/records/search"
+        )
+        conditions = [
+            {"field_name": "entity_id", "operator": "is", "value": [entity_id]},
+            {"field_name": "所属小说ID", "operator": "is", "value": [novel_id]},
+        ]
+        if chapter_tag:
+            conditions.append(
+                {"field_name": "章节标签", "operator": "is", "value": [chapter_tag]}
+            )
+        try:
+            resp = requests.post(
+                search_url,
+                headers=self._get_headers(),
+                json={"filter": {"conjunction": "and", "conditions": conditions}}
+            )
+            resp.raise_for_status()
+            items = resp.json().get("data", {}).get("items", [])
+            if not items:
+                return {"found": False}
+            # 多条结果取最新一条（飞书默认按创建时间返回）
+            rec = items[-1]
+            fields = rec.get("fields", {})
+            raw_seed = fields.get("Seed值", 0)
+            try:
+                seed_val = int(float(str(raw_seed).strip())) if raw_seed else 0
+            except Exception:
+                seed_val = 0
+            return {
+                "record_id": rec["record_id"],
+                "image_url": self._flatten(fields.get("图片URL", "")),
+                "seed": seed_val,
+                "visual_prompt": self._flatten(fields.get("视觉描述（英文Prompt）", "")),
+                "chapter_tag": self._flatten(fields.get("章节标签", "")),
+                "found": True,
+            }
+        except Exception as e:
+            logger.error(f"get_asset_by_entity entity_id={entity_id}: {e}")
+            return {"found": False}
+
+    def get_entity_visual_history(
+        self, entity_id: str, novel_id: str, max_entries: int = 10
+    ) -> list:
+        """
+        按章节顺序返回该实体的全部历史视觉快照（用于 Stage2 上下文注入）。
+        返回 [{"chapter_tag": str, "visual_prompt": str, "image_url": str, "seed": int}, ...]
+        """
+        search_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_FACTORY}"
+            f"/tables/{TABLE_FACTORY}/records/search"
+        )
+        try:
+            resp = requests.post(
+                search_url,
+                headers=self._get_headers(),
+                json={
+                    "page_size": max_entries,
+                    "filter": {
+                        "conjunction": "and",
+                        "conditions": [
+                            {"field_name": "entity_id", "operator": "is", "value": [entity_id]},
+                            {"field_name": "所属小说ID", "operator": "is", "value": [novel_id]},
+                        ]
+                    }
+                }
+            )
+            resp.raise_for_status()
+            items = resp.json().get("data", {}).get("items", [])
+            history = []
+            for rec in items:
+                f = rec.get("fields", {})
+                raw_seed = f.get("Seed值", 0)
+                try:
+                    s = int(float(str(raw_seed).strip())) if raw_seed else 0
+                except Exception:
+                    s = 0
+                history.append({
+                    "chapter_tag": self._flatten(f.get("章节标签", "")),
+                    "visual_prompt": self._flatten(f.get("视觉描述（英文Prompt）", "")),
+                    "image_url": self._flatten(f.get("图片URL", "")),
+                    "seed": s,
+                })
+            logger.info(f"📸 [视觉历史] entity_id={entity_id} 共 {len(history)} 条历史快照")
+            return history
+        except Exception as e:
+            logger.error(f"get_entity_visual_history entity_id={entity_id}: {e}")
+            return []
+
+    def upsert_asset_record(
+        self,
+        novel_id: str,
+        entity_id: str,
+        entity_name: str,
+        asset_type: str,
+        visual_prompt: str,
+        image_url: str,
+        seed: int,
+        chapter_tag: str,
+        is_evolution: bool = False,
+        old_visual_prompt: str = "",
+    ) -> str:
+        """
+        v2.7.0: 版本化写入视觉素材记录。
+
+        策略:
+          - 同实体同章节已有记录 → 直接更新（幂等重试安全）
+          - 同实体有旧记录但章节不同（首次出现/发生视觉演进）→
+            将旧版 visual_prompt 追加至「历史快照」后写入新行（保留进化轨迹）
+          - 全新实体 → 搜索空行回填，找不到则 batch_create
+
+        Returns: 新建/更新的 record_id
+        """
+        base_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_FACTORY}"
+            f"/tables/{TABLE_FACTORY}/records"
+        )
+        create_url = f"{base_url}/batch_create"
+        update_url = f"{base_url}/batch_update"
+
+        # ① 检查同实体同章节是否已有记录（幂等）
+        existing_same_ch = self.get_asset_by_entity(entity_id, novel_id, chapter_tag)
+        if existing_same_ch.get("found"):
+            rec_id = existing_same_ch["record_id"]
+            try:
+                upd_resp = requests.put(
+                    f"{base_url}/{rec_id}",
+                    headers=self._get_headers(),
+                    json={"fields": {
+                        "视觉描述（英文Prompt）": visual_prompt,
+                        "图片URL": image_url,
+                        "Seed值": seed,
+                        "生成状态": "已生成",
+                    }}
+                )
+                upd_resp.raise_for_status()
+                logger.info(f"🖼️ [素材更新] {entity_name} @{chapter_tag} 幂等更新")
+                return rec_id
+            except Exception as e:
+                logger.error(f"upsert_asset_record 更新异常: {e}")
+                return ""
+
+        # ② 构造新字段
+        # 若是视觉演进，把旧 prompt 追加进「历史快照」字段
+        history_snapshot = ""
+        if is_evolution and old_visual_prompt:
+            prev_asset = self.get_asset_by_entity(entity_id, novel_id)
+            if prev_asset.get("found"):
+                prev_history = self._flatten(
+                    self._search_field_in_factory(prev_asset["record_id"], "历史快照")
+                )
+                history_snapshot = (
+                    f"{prev_history}\n---\n[{chapter_tag}前] {old_visual_prompt}"
+                ).strip("---\n")
+            else:
+                history_snapshot = f"[初始] {old_visual_prompt}"
+
+        new_fields = {
+            "所属小说ID": novel_id,
+            "entity_id": entity_id,
+            "素材类型": asset_type,
+            "视觉描述（英文Prompt）": visual_prompt,
+            "图片URL": image_url,
+            "Seed值": seed,
+            "章节标签": chapter_tag,
+            "生成状态": "已生成",
+        }
+        if history_snapshot:
+            new_fields["历史快照"] = history_snapshot
+
+        # ③ 空行优先回填
+        blank_ids = self._get_blank_record_ids(APP_TOKEN_FACTORY, TABLE_FACTORY)
+        if blank_ids:
+            target_rid = blank_ids[0]
+            try:
+                lock_resp = requests.put(
+                    f"{base_url}/{target_rid}",
+                    headers=self._get_headers(),
+                    json={"fields": new_fields}
+                )
+                lock_resp.raise_for_status()
+                logger.info(f"🖼️ [素材回填] {entity_name} @{chapter_tag} → 空行 {target_rid}")
+                return target_rid
+            except Exception as e:
+                logger.error(f"upsert_asset_record 空行回填异常: {e}")
+
+        # ④ 降级新建
+        try:
+            resp = requests.post(
+                create_url,
+                headers=self._get_headers(),
+                json={"records": [{"fields": new_fields}]}
+            )
+            resp.raise_for_status()
+            recs = resp.json().get("data", {}).get("records", [])
+            if recs:
+                rid = recs[0]["record_id"]
+                logger.info(f"🖼️ [素材新建] {entity_name} @{chapter_tag} → {rid}")
+                return rid
+        except Exception as e:
+            logger.error(f"upsert_asset_record 新建异常: {e}")
+        return ""
+
+    def _search_field_in_factory(self, record_id: str, field_name: str) -> str:
+        """辅助方法：读取素材表单条记录的指定字段值。"""
+        url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_FACTORY}"
+            f"/tables/{TABLE_FACTORY}/records/{record_id}"
+        )
+        try:
+            resp = requests.get(url, headers=self._get_headers())
+            resp.raise_for_status()
+            fields = resp.json().get("data", {}).get("record", {}).get("fields", {})
+            return self._flatten(fields.get(field_name, ""))
+        except Exception as e:
+            logger.error(f"_search_field_in_factory [{field_name}]: {e}")
+            return ""
