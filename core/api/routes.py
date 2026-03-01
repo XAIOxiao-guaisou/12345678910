@@ -1,5 +1,6 @@
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
+from typing import List, Optional
 from core.models.schemas import TaskRequest, NovelSubmission, BatchNovelSubmission
 from core.pipeline import PipelineOrchestrator
 import logging
@@ -302,16 +303,45 @@ async def reroute_sandbox(req: RerouteRequest):
 # =============================================================
 
 @router.post("/api/upload_novel_batch")
-async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: BackgroundTasks):
+async def upload_novel_batch(
+    background_tasks: BackgroundTasks,
+    novel_id: str = Form(...),
+    files: List[UploadFile] = File(...),
+    memory_lock: bool = Form(False),
+    style: str = Form("anime"),
+    gateway: str = Form("wan_2_6"),
+    sandbox_mode: bool = Form(True),
+    chunk_size: int = Form(1000),
+):
     """
-    批量多文件上传入口。
-    返回 task_id 供前端轮询或订阅 SSE 流。
+    批量多文件上传入口（multipart/form-data）。
+    接受浏览器 FormData 提交的文件列表，自动转换为 FileItem 格式。
+    返回 task_id 供前端订阅 SSE 流。
     """
+    # 验证 novel_id（防路径穿越）
+    import re
+    if not re.match(r'^[\w\u4e00-\u9fa5\-]{1,32}$', novel_id):
+        raise HTTPException(status_code=422, detail="novel_id 格式非法，只允许汉字/字母/数字/下划线/连字符，长度1-32")
+
+    # 读取上传文件内容，构建 FileItem 列表
+    from core.models.schemas import FileItem
+    file_items = []
+    for upload_file in files:
+        raw = await upload_file.read()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw.decode("gbk", errors="replace")
+        file_items.append(FileItem(name=upload_file.filename or "chapter.txt", content=content))
+
+    if not file_items:
+        raise HTTPException(status_code=422, detail="未收到任何文件")
+
     task_id = str(uuid.uuid4())
     _batch_tasks[task_id] = {
         "status": "queued",
-        "novel_id": req.novel_id,
-        "total_files": len(req.files),
+        "novel_id": novel_id,
+        "total_files": len(file_items),
         "stage1_done": 0,
         "stage2_done": 0,
         "scenes": 0,
@@ -351,15 +381,16 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
 
         try:
             result = await pipeline.process_files_batch(
-                files=[f.dict() for f in req.files],
-                novel_id=req.novel_id,
-                style_key=req.style,
-                gateway=req.gateway,
-                video_params=req.video_params,
-                sandbox_mode=req.sandbox_mode,
-                chunk_size=req.chunk_size,
+                files=[f.dict() for f in file_items],
+                novel_id=novel_id,
+                style_key=style,
+                gateway=gateway,
+                video_params={},
+                sandbox_mode=sandbox_mode,
+                chunk_size=chunk_size,
                 on_progress=on_progress,
                 task_id=task_id,
+                memory_lock=memory_lock,
             )
             task["status"] = result.get("status", "done")
             task["scenes"] = result.get("scenes", 0)
@@ -372,12 +403,12 @@ async def upload_novel_batch(req: BatchNovelSubmission, background_tasks: Backgr
             save_batch_tasks()
 
     asyncio.create_task(_run_batch())
-    logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={req.novel_id}, 文件数={len(req.files)}")
+    logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={novel_id}, 文件数={len(file_items)}")
     return {
         "status": "ok",
         "task_id": task_id,
-        "novel_id": req.novel_id,
-        "total_files": len(req.files),
+        "novel_id": novel_id,
+        "total_files": len(file_items),
         "message": f"批量任务已入队，使用 task_id={task_id} 查询进度"
     }
 
@@ -481,3 +512,58 @@ async def progress_stream(task_id: str):
             "X-Accel-Buffering": "no",  # 防止 Nginx 缓充
         }
     )
+
+@router.get("/api/tasks/active")
+async def get_active_task():
+    """返回当前最近一个未完成的 Batch Task，便于页面刷新后自动重连进度条。"""
+    active_tasks = {k: v for k, v in _batch_tasks.items() if not v.get("finished", False)}
+    if not active_tasks:
+        return {"status": "none"}
+    
+    # 获取最后插入的活跃任务
+    latest_task_id = list(active_tasks.keys())[-1]
+    task = active_tasks[latest_task_id]
+    return {
+        "status": "active",
+        "task_id": latest_task_id,
+        "novel_id": task.get("novel_id", ""),
+        "total_files": task.get("total_files", 0)
+    }
+
+@router.post("/api/tasks/stop/{task_id}")
+async def stop_task(task_id: str):
+    """
+    将指定任务标记为已停止（finished=True, status=stopped）。
+    后台 asyncio 任务在下一个章节检查点时会读取此标记并提前退出。
+    """
+    if task_id not in _batch_tasks:
+        raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+    _batch_tasks[task_id]["finished"] = True
+    _batch_tasks[task_id]["status"] = "stopped"
+    _batch_tasks[task_id]["cancelled"] = True
+    save_batch_tasks()
+    logger.info(f"🛑 任务 {task_id} 已被手动停止")
+    return {"status": "stopped", "task_id": task_id}
+
+@router.post("/api/tasks/stop_all")
+async def stop_all_tasks():
+    """停止所有当前活跃任务（批量停止）。"""
+    stopped = []
+    for task_id, task in _batch_tasks.items():
+        if not task.get("finished", False):
+            task["finished"] = True
+            task["status"] = "stopped"
+            task["cancelled"] = True
+            stopped.append(task_id)
+    save_batch_tasks()
+    logger.info(f"🛑 已停止 {len(stopped)} 个活跃任务: {stopped}")
+    return {"status": "ok", "stopped": stopped}
+
+@router.get("/api/system/health")
+async def get_system_health():
+    """获取系统关键服务的健康状态，主要是 Aria2c"""
+    from core.services.download_service import aria2c_service
+    aria2_health = await aria2c_service.is_healthy()
+    return {
+        "aria2c_healthy": aria2_health
+    }

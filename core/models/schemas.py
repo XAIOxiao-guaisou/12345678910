@@ -53,6 +53,7 @@ class BatchNovelSubmission(BaseModel):
     video_params: Dict[str, Any] = {}
     sandbox_mode: bool = True
     chunk_size: int = 1000
+    memory_lock: bool = False
 
     @validator("novel_id")
     def validate_novel_id(cls, v):

@@ -36,10 +36,12 @@ TABLE_MEMORY = os.environ.get("FEISHU_TABLE_MEMORY", "tblcFydnJuwD8cIy")
 # -------------------------------------------------------
 REQUIRED_MEMORY_FIELDS = [
     "类别", "词条名", "深层设定逻辑", "视觉氛围与美学隐喻",
-    "所属小说ID", "entity_id", "version", "last_update_chapter", "status"
+    "所属小说ID", "entity_id", "version", "last_update_chapter",
+    "status", "历史变更记录", "引用分镜ID", "环境标签"
 ]
 REQUIRED_SCRIPT_FIELDS = [
-    "集数/场次", "视觉提示词", "状态", "所属模型/网关", "章节处理状态", "所属章节文件名", "任务ID"
+    "集数/场次", "视觉提示词", "状态", "所属模型/网关",
+    "章节处理状态", "所属章节文件名", "任务ID", "关联记忆实体", "环境标签"
 ]
 
 class FeishuBitableManager:
@@ -47,7 +49,8 @@ class FeishuBitableManager:
         self.tenant_access_token = None
         self.token_expire_time = 0
         self._check_required_fields()
-        
+        self.purge_redundant_fields()  # 自动清理废弃字段（幂等）
+
     def _get_token(self):
         if time.time() < self.token_expire_time:
             return self.tenant_access_token
@@ -121,7 +124,123 @@ class FeishuBitableManager:
     def purge_memory_records(self): return self._purge_table(APP_TOKEN_MEMORY, TABLE_MEMORY, "记忆中枢")
 
     # =======================================================
-    # P0: 字段自校验 + 自动创建缺失字段
+    # 空白行检测（优先填入而非追加）
+    # =======================================================
+    def _get_blank_record_ids(self, app_token: str, table_id: str,
+                               key_field: str = "集数/场次") -> list:
+        """
+        扫描表中「key_field」为空的行，返回 record_id 列表。
+        用于「空白行优先填入」策略：避免表中已有空行被跳过。
+        """
+        search_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}"
+            f"/tables/{table_id}/records/search"
+        )
+        blank_ids = []
+        page_token = None
+        try:
+            while True:
+                payload = {
+                    "page_size": 500,
+                    "filter": {
+                        "conjunction": "and",
+                        "conditions": [{"field_name": key_field, "operator": "isEmpty"}]
+                    }
+                }
+                if page_token:
+                    payload["page_token"] = page_token
+                resp = requests.post(search_url, headers=self._get_headers(), json=payload)
+                resp.raise_for_status()
+                data = resp.json().get("data", {})
+                blank_ids.extend(r["record_id"] for r in data.get("items", []))
+                page_token = data.get("page_token")
+                if not data.get("has_more"):
+                    break
+        except Exception as e:
+            logger.warning(f"_get_blank_record_ids 扫描失败（降级为纯创建模式）: {e}")
+        logger.info(f"📋 [空白行扫描] 发现 {len(blank_ids)} 个可填入行")
+        return blank_ids
+
+    # =======================================================
+    # 分镜状态推进（解决永久停留「拆解中」）
+    # =======================================================
+    def update_scenes_status(self, record_ids: list, status: str = "已拆解") -> int:
+        """
+        批量将剧本分镜的「状态」字段从「拆解中」推进到目标状态。
+        在 insert_new_parsed_scenes 写入成功后自动调用，
+        也可在 Stage2 流程完成后再次调用推进到「Stage2完成」。
+        """
+        if not record_ids:
+            return 0
+        base_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+            f"/tables/{TABLE_SCRIPT}/records"
+        )
+        updates = [
+            {"record_id": rid, "fields": {"状态": [status]}}
+            for rid in record_ids
+        ]
+        ok = 0
+        for start in range(0, len(updates), 100):
+            batch = updates[start:start + 100]
+            try:
+                resp = requests.post(
+                    f"{base_url}/batch_update",
+                    headers=self._get_headers(),
+                    json={"records": batch}
+                )
+                resp.raise_for_status()
+                body = resp.json()
+                if body.get("code") == 0:
+                    ok += len(body.get("data", {}).get("records", []))
+                else:
+                    logger.error(f"update_scenes_status 错误: {body.get('msg')}")
+            except Exception as e:
+                logger.error(f"update_scenes_status 批次 {start // 100 + 1} 异常: {e}")
+        logger.info(f"✅ [状态推进] {ok}/{len(record_ids)} 条分镜 → '{status}'")
+        return ok
+
+    # =======================================================
+    # 记忆词条 ↔ 分镜记录 双向关联
+    # =======================================================
+    def link_memory_to_scenes(self, entity_id_to_script_rids: dict) -> int:
+        """
+        将分镜 record_id 追加写入对应记忆词条的「引用分镜ID」字段。
+        entity_id_to_script_rids: {entity_id: [script_record_id, ...]}
+        实现记忆中枢 → 剧本的正向关联（两表互通）。
+        """
+        if not entity_id_to_script_rids:
+            return 0
+        search_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_MEMORY}"
+            f"/tables/{TABLE_MEMORY}/records/search"
+        )
+        updates = []
+        for entity_id, script_rids in entity_id_to_script_rids.items():
+            if not script_rids:
+                continue
+            try:
+                resp = requests.post(search_url, headers=self._get_headers(), json={
+                    "filter": {"conjunction": "and", "conditions": [
+                        {"field_name": "entity_id", "operator": "is", "value": [entity_id]}
+                    ]}
+                })
+                resp.raise_for_status()
+                items = resp.json().get("data", {}).get("items", [])
+                if not items:
+                    continue
+                mem_rec_id = items[0]["record_id"]
+                existing_refs = self._flatten(items[0].get("fields", {}).get("引用分镜ID", ""))
+                new_part = ",".join(script_rids)
+                merged = f"{existing_refs},{new_part}".strip(",") if existing_refs else new_part
+                updates.append((mem_rec_id, {"引用分镜ID": merged}))
+            except Exception as e:
+                logger.error(f"link_memory_to_scenes entity_id={entity_id}: {e}")
+        if updates:
+            return self.batch_update_memories(updates)
+        return 0
+
+
     # =======================================================
     def _list_table_fields(self, app_token, table_id):
         """获取指定表的所有字段名列表"""
@@ -134,6 +253,60 @@ class FeishuBitableManager:
         except Exception as e:
             logger.error(f"_list_table_fields 失败: {e}")
             return []
+
+    def _list_table_fields_with_ids(self, app_token: str, table_id: str) -> dict:
+        """返回 {field_name: field_id} 映射，用于字段删除操作。"""
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
+        result = {}
+        try:
+            resp = requests.get(url, headers=self._get_headers())
+            resp.raise_for_status()
+            for f in resp.json().get("data", {}).get("items", []):
+                result[f["field_name"]] = f["field_id"]
+        except Exception as e:
+            logger.error(f"_list_table_fields_with_ids 失败: {e}")
+        return result
+
+    def _delete_field(self, app_token: str, table_id: str, field_id: str, label: str = "") -> bool:
+        """删除飞书多维表格中的指定字段（安全白名单机制保护）。"""
+        url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}"
+               f"/tables/{table_id}/fields/{field_id}")
+        try:
+            resp = requests.delete(url, headers=self._get_headers())
+            resp.raise_for_status()
+            body = resp.json()
+            if body.get("code") == 0:
+                logger.info(f"🗑️ 字段删除成功: [{label}]")
+                return True
+            logger.warning(f"字段删除响应异常: [{label}] {body.get('msg')}")
+            return False
+        except Exception as e:
+            logger.error(f"_delete_field [{label}] 异常: {e}")
+            return False
+
+    def purge_redundant_fields(self) -> dict:
+        """
+        程序化清理已确认废弃的字段（白名单机制，仅删除下列明确无写入路径的字段）。
+          剧本拆解表: 音频提示词（Stage2 已不再写入，字段恒为空）
+        Returns: {table_label: [deleted_field_names]}
+        """
+        REDUNDANT = {
+            "剧本拆解表": (APP_TOKEN_SCRIPT, TABLE_SCRIPT, ["音频提示词"]),
+        }
+        report = {}
+        for label, (app_token, table_id, fields_to_del) in REDUNDANT.items():
+            field_map = self._list_table_fields_with_ids(app_token, table_id)
+            deleted = []
+            for fname in fields_to_del:
+                fid = field_map.get(fname)
+                if not fid:
+                    logger.info(f"🔍 [{label}] 字段 '{fname}' 不存在（可能已删除），跳过")
+                    continue
+                if self._delete_field(app_token, table_id, fid, label=f"{label}.{fname}"):
+                    deleted.append(fname)
+            report[label] = deleted
+            logger.info(f"🧹 [{label}] 废弃字段清理: {deleted}")
+        return report
 
     def _create_field(self, app_token, table_id, field_name, field_type=1):
         """
@@ -166,8 +339,8 @@ class FeishuBitableManager:
             (APP_TOKEN_SCRIPT, TABLE_SCRIPT, "剧本拆解表", REQUIRED_SCRIPT_FIELDS),
         ]
         # 字段类型映射
-        field_type_map = {"version": 2}  # 数字类型
-        single_select_fields = {"status", "章节处理状态"}
+        field_type_map = {"version": 2}  # 2 = 数字类型
+        single_select_fields = {"status", "章节处理状态", "状态", "环境标签"}
 
         for app_token, table_id, label, required in checks:
             try:
@@ -375,14 +548,19 @@ class FeishuBitableManager:
     # =======================================================
     # P0: 事务性 Stage1 完成标记（写回飞书成功后才标记）
     # =======================================================
-    def mark_chapter_stage1_complete(self, novel_id: str, chapter_name: str) -> bool:
+    def mark_chapter_stage1_complete(self, novel_id: str, chapter_name: str,
+                                      sandbox_mode: bool = False) -> bool:
         """
-        在【剧本拆解表】中查找该 novel_id + chapter_name 的记录，
-        将「章节处理状态」标记为「Stage1完成」。
+        在【剧本拆解表】中标记该章节 Stage1 已完成。
+        sandbox_mode: True → 标记为「sandbox」环境，与生产标记完全隔离。
         仅在 batch_update + batch_create 确认成功后调用，实现事务一致性。
         """
-        search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/search"
-        base_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records"
+        search_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+                      f"/tables/{TABLE_SCRIPT}/records/search")
+        base_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+                    f"/tables/{TABLE_SCRIPT}/records")
+        env_label = "sandbox" if sandbox_mode else "production"
+        status_tag = "Stage1完成[沙盒]" if sandbox_mode else "Stage1完成"
         try:
             payload = {
                 "filter": {
@@ -390,43 +568,45 @@ class FeishuBitableManager:
                     "conditions": [
                         {"field_name": "所属小说ID", "operator": "is", "value": [novel_id]},
                         {"field_name": "所属章节文件名", "operator": "is", "value": [chapter_name]},
+                        {"field_name": "环境标签", "operator": "is", "value": [env_label]},
                     ]
                 }
             }
             resp = requests.post(search_url, headers=self._get_headers(), json=payload)
             resp.raise_for_status()
             items = resp.json().get("data", {}).get("items", [])
+            fields_to_write = {
+                "所属小说ID": novel_id,
+                "所属章节文件名": chapter_name,
+                "章节处理状态": status_tag,
+                "环境标签": env_label,
+            }
             if not items:
-                # 尚无该章节记录，创建占位标记
-                create_resp = requests.post(
-                    f"{base_url}",
-                    headers=self._get_headers(),
-                    json={"fields": {
-                        "所属小说ID": novel_id,
-                        "所属章节文件名": chapter_name,
-                        "章节处理状态": "Stage1完成",
-                    }}
-                )
+                create_resp = requests.post(base_url, headers=self._get_headers(),
+                                            json={"fields": fields_to_write})
                 create_resp.raise_for_status()
-                logger.info(f"📌 [事务标记] 新建章节占位: novel={novel_id}, chapter={chapter_name}")
+                logger.info(f"📌 [事务标记] 新建占位[{env_label}]: novel={novel_id}, chapter={chapter_name}")
                 return True
-            # 更新已有记录
             record_id = items[0]["record_id"]
-            upd_resp = requests.put(
-                f"{base_url}/{record_id}",
-                headers=self._get_headers(),
-                json={"fields": {"章节处理状态": "Stage1完成"}}
-            )
+            upd_resp = requests.put(f"{base_url}/{record_id}", headers=self._get_headers(),
+                                    json={"fields": {"章节处理状态": status_tag}})
             upd_resp.raise_for_status()
-            logger.info(f"✅ [事务标记] Stage1完成 标记成功: novel={novel_id}, chapter={chapter_name}")
+            logger.info(f"✅ [事务标记][{env_label}] Stage1完成: novel={novel_id}, chapter={chapter_name}")
             return True
         except Exception as e:
             logger.error(f"mark_chapter_stage1_complete 异常: {e}")
             return False
 
-    def check_chapter_stage1_done(self, novel_id: str, chapter_name: str) -> bool:
-        """检查该章节是否已完成 Stage1（用于断点续传跳过判断）"""
-        search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/search"
+    def check_chapter_stage1_done(self, novel_id: str, chapter_name: str,
+                                   sandbox_mode: bool = False) -> bool:
+        """
+        检查该章节是否已完成 Stage1（用于断点续传跳过判断）。
+        sandbox_mode: True → 仅起漫 sandbox 运行标记，不与生产记录混淆。
+        """
+        search_url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+                      f"/tables/{TABLE_SCRIPT}/records/search")
+        env_label = "sandbox" if sandbox_mode else "production"
+        status_tag = "Stage1完成[沙盒]" if sandbox_mode else "Stage1完成"
         try:
             payload = {
                 "filter": {
@@ -434,7 +614,8 @@ class FeishuBitableManager:
                     "conditions": [
                         {"field_name": "所属小说ID", "operator": "is", "value": [novel_id]},
                         {"field_name": "所属章节文件名", "operator": "is", "value": [chapter_name]},
-                        {"field_name": "章节处理状态", "operator": "is", "value": ["Stage1完成"]},
+                        {"field_name": "章节处理状态", "operator": "is", "value": [status_tag]},
+                        {"field_name": "环境标签", "operator": "is", "value": [env_label]},
                     ]
                 }
             }
@@ -587,65 +768,142 @@ class FeishuBitableManager:
             logger.error(f"Error fetching memories: {e}")
             return []
 
-    def insert_new_parsed_scenes(self, scenes_array, episode_start=1, task_id: str = ""):
-        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/batch_create"
+    def insert_new_parsed_scenes(
+        self,
+        scenes_array,
+        episode_start=1,
+        task_id: str = "",
+        sandbox_mode: bool = False,
+        novel_id: str = "",
+        chapter_name: str = "",
+        gateway: str = "",
+    ) -> list:
+        """
+        写入分镜到【剧本拆解表】— v2.7 重构版。
+        变更：
+          · 空白行优先填入（不再跳过现有空行）
+          · sandbox/production 环境标签隔离
+          · 自动推进状态 拆解中 → 已拆解（解决永久停留问题）
+          · 写入「关联记忆实体」字段（scene.entity_ids → 逗号字符串）
+          · 移除「音频提示词」写入（该字段已废弃）
+          · 修正「gateway」参数（之前为无效关键字参数）
+        """
+        create_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+            f"/tables/{TABLE_SCRIPT}/records/batch_create"
+        )
+        update_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+            f"/tables/{TABLE_SCRIPT}/records/batch_update"
+        )
+        env_label = "sandbox" if sandbox_mode else "production"
+
+        def flatten_prompt(prompt_data):
+            if isinstance(prompt_data, dict):
+                return "\n".join([f"{k}: {v}" for k, v in prompt_data.items()])
+            elif isinstance(prompt_data, list):
+                return "\n".join([str(item) for item in prompt_data])
+            return str(prompt_data)
+
         records = []
         for i, scene in enumerate(scenes_array):
             content_desc = scene.get("summary", "")
             if "visual_logic" in scene:
                 logic = scene["visual_logic"]
-                visual_logic_text = f"【0-5s】{logic.get('shot_1_0_5s', '')}\n【5-10s】{logic.get('shot_2_5_10s', '')}\n【10-15s】{logic.get('shot_3_10_15s', '')}"
+                visual_logic_text = (
+                    f"【0-5s】{logic.get('shot_1_0_5s', '')}\n"
+                    f"【5-10s】{logic.get('shot_2_5_10s', '')}\n"
+                    f"【10-15s】{logic.get('shot_3_10_15s', '')}"
+                )
             else:
                 visual_logic_text = scene.get("scene_desc", "")
-                
-            def flatten_prompt(prompt_data):
-                if isinstance(prompt_data, dict):
-                    return "\n".join([f"{k}: {v}" for k, v in prompt_data.items()])
-                elif isinstance(prompt_data, list):
-                    return "\n".join([str(item) for item in prompt_data])
-                return str(prompt_data)
 
             visual_raw = scene.get("master_prompt", scene.get("visual_prompt", ""))
             visual_prompt = flatten_prompt(visual_raw)
-            
-            audio_raw = scene.get("audio_plan", scene.get("audio_prompt", ""))
-            audio_prompt = flatten_prompt(audio_raw)
-            
+
             scene_fields = {
                 "集数/场次": episode_start + i,
-                "小说原文（内容）": scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}"), 
+                "小说原文（内容）": scene.get("novel_text", f"Scene {scene.get('scene_num', i+1)}"),
                 "状态": ["拆解中"],
                 "场景描述": f"{content_desc}\n\n镜头逻辑:\n{visual_logic_text}",
                 "视觉提示词": visual_prompt,
-                "音频提示词": audio_prompt
+                "环境标签": env_label,
             }
             if task_id:
                 scene_fields["任务ID"] = task_id
-            
+            if novel_id:
+                scene_fields["所属小说ID"] = novel_id
+            if chapter_name:
+                scene_fields["所属章节文件名"] = chapter_name
+            if gateway:
+                scene_fields["所属模型/网关"] = gateway
+
+            # 关联记忆实体（scene 若携带 entity_ids 则写入）
+            entity_ids = scene.get("entity_ids", [])
+            if entity_ids:
+                if isinstance(entity_ids, list):
+                    scene_fields["关联记忆实体"] = ",".join(str(e) for e in entity_ids)
+                else:
+                    scene_fields["关联记忆实体"] = str(entity_ids)
+
             records.append({"fields": scene_fields})
-        
+
+        # ── Phase 1: 空白行优先填入 ──────────────────────────────
+        blank_ids = self._get_blank_record_ids(APP_TOKEN_SCRIPT, TABLE_SCRIPT, "集数/场次")
         created_ids = []
+
+        if blank_ids and records:
+            fill_count = min(len(blank_ids), len(records))
+            fill_payload = [
+                {"record_id": blank_ids[j], "fields": records[j]["fields"]}
+                for j in range(fill_count)
+            ]
+            for start in range(0, len(fill_payload), 100):
+                batch = fill_payload[start:start + 100]
+                try:
+                    resp = requests.post(update_url, headers=self._get_headers(),
+                                         json={"records": batch})
+                    resp.raise_for_status()
+                    body = resp.json()
+                    if body.get("code") == 0:
+                        ids = [r["record_id"] for r in body.get("data", {}).get("records", [])]
+                        created_ids.extend(ids)
+                        logger.info(f"📝 [空白行填入] 第{start//100+1}批: {len(ids)} 条")
+                    else:
+                        logger.error(f"空白行填入错误: {body.get('msg')}")
+                except Exception as e:
+                    logger.error(f"空白行填入批次异常: {e}")
+            records = records[fill_count:]  # 剩余走 batch_create
+
+        # ── Phase 2: 剩余记录 batch_create ──────────────────────
         batch_size = 490
         for batch_start in range(0, len(records), batch_size):
             batch = records[batch_start: batch_start + batch_size]
-            payload = {"records": batch}
             try:
-                resp = requests.post(url, headers=self._get_headers(), json=payload)
+                resp = requests.post(create_url, headers=self._get_headers(),
+                                     json={"records": batch})
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("code") != 0:
                     raise Exception(f"Feishu API Error: {json.dumps(data, ensure_ascii=False)}")
                 new_ids = [r.get("record_id") for r in data.get("data", {}).get("records", [])]
                 if not new_ids:
-                    raise Exception(f"No records returned by Feishu: {json.dumps(data, ensure_ascii=False)}")
+                    raise Exception(f"No records returned: {json.dumps(data, ensure_ascii=False)}")
                 created_ids.extend(new_ids)
-                logger.info(f"📋 第 {batch_start//batch_size+1} 批写入飞书完成 ({len(new_ids)} 条).")
+                logger.info(f"📋 第{batch_start//batch_size+1}批写入飞书完成 ({len(new_ids)} 条)")
             except Exception as e:
                 err_msg = str(e)
-                if hasattr(e, 'response') and e.response is not None:
+                if hasattr(e, "response") and e.response is not None:
                     err_msg += f" | Response: {e.response.text}"
-                logger.error(f"Error bulk inserting batch: {err_msg}")
+                logger.error(f"insert_new_parsed_scenes 批次异常: {err_msg}")
+
+        # ── Phase 3: 状态推进 拆解中 → 已拆解 ─────────────────────
+        if created_ids:
+            self.update_scenes_status(created_ids, "已拆解")
+
         return created_ids
+
+
 
     def create_factory_stubs(self, script_record_ids, character="陈伶"):
         if not script_record_ids: return 0

@@ -132,7 +132,13 @@ class PipelineOrchestrator:
                 str(prompt_raw), {**video_params, "_sandbox_mode": True}, gateway
             )
 
-        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1, gateway=gateway)
+        inserted_ids = self.bitable.insert_new_parsed_scenes(
+            all_scenes, 1,
+            task_id=getattr(self, "_current_task_id", ""),
+            sandbox_mode=sandbox_mode,
+            novel_id=novel_id,
+            gateway=gateway,
+        )
         prompts = [
             scene.get("visual_prompt", "")
             for scene in all_scenes if scene.get("visual_prompt")
@@ -159,6 +165,7 @@ class PipelineOrchestrator:
         chunk_size: int = 1000,
         on_progress=None,
         task_id: str = "",
+        memory_lock: bool = False,
     ):
         """
         v2.6.0 批量文件处理入口。
@@ -168,7 +175,7 @@ class PipelineOrchestrator:
         if video_params is None:
             video_params = {}
 
-        logger.info(f"📚 [批量流水线] 开始: novel_id={novel_id}, 文件数={len(files)}")
+        logger.info(f"📚 [批量流水线] 开始: novel_id={novel_id}, 文件数={len(files)}, memory_lock={memory_lock}")
 
         # === Stage1: 同 novel_id 内串行（章节相互依赖）===
         all_scenes = []
@@ -185,19 +192,29 @@ class PipelineOrchestrator:
 
             # novel_id 粒度锁：同一小说的章节必须按序处理
             async with self.novel_locks[novel_id]:
-                result = await MemoryEngine.evolve_memory(
-                    novel_id=novel_id,
-                    chapter_text=chapter_text,
-                    chapter_name=chapter_name,
-                    bitable=self.bitable,
-                    chapter_index=chapter_idx,
-                )
+                if memory_lock:
+                    logger.info(f"🔒 [MemoryLock] 记忆演进逻辑已被锁定，跳过 {chapter_name} 的记忆提取")
+                    result = {"status": "success", "message": "Memory lock enabled, skipped."}
+                else:
+                    result = await MemoryEngine.evolve_memory(
+                        novel_id=novel_id,
+                        chapter_text=chapter_text,
+                        chapter_name=chapter_name,
+                        bitable=self.bitable,
+                        chapter_index=chapter_idx,
+                    )
+                
                 if result["status"] not in ("success", "partial_error"):
                     logger.error(f"❌ Stage1 失败: {chapter_name} -> {result.get('message')}")
                 if on_progress:
                     await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, result["status"])
 
-        # === Stage2: Semaphore(3) 并发分镜 ===
+            # 无论是否 memory_lock 都必须做 Stage1_done 标记，以便断点续传后续
+            if result["status"] in ("success", "partial_error"):
+                self.bitable.mark_chapter_stage1_complete(novel_id, chapter_name)
+
+        # === Stage2: 严格章节顺序串行 + 每章 Semaphore(3) 内并发 + 3次重试 ===
+        # 章节顺序强保证: 1→N 一个不跳过，确保剧情发展不乱序
         all_memories_dict = self.bitable.get_memories_by_novel(novel_id)
         active_memories = [
             v["fields"] for v in all_memories_dict.values()
@@ -205,48 +222,98 @@ class PipelineOrchestrator:
         ]
 
         sem = asyncio.Semaphore(3)
-        all_chunks = []
-        for file_info in files:
-            chunks = DeepSeekService.smart_chunk_text(file_info.get("content", ""), chunk_size)
-            chapter_name = file_info.get("name", "")
-            all_chunks.extend([(c, chapter_name) for c in chunks])
+        episode_counter = [1]  # 共享计数器，用 list 实现可变序号
 
-        async def _stage2_chunk(chunk_text, chapter_name, chunk_idx):
-            async with sem:
-                relevant = []
-                for mem in active_memories:
-                    name = mem.get("name", "")
-                    if name and name in chunk_text:
-                        relevant.append(mem)
-                    elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
-                        relevant.append(mem)
-                mem_ctx = "【全局世界观与当前段落相关的记忆词条】\n"
-                for rm in relevant:
-                    mem_ctx += f"- [{rm.get('category', '设定')}] {rm.get('name', '')}: {rm.get('lore', '')}\n"
-                return await asyncio.to_thread(
-                    DeepSeekService.generate_scenes_for_chunk, chunk_text, mem_ctx
+        async def _stage2_chapter(file_info: dict, chapter_idx_s2: int) -> list:
+            """Stage2 单章节处理，内部并发切片，外部串行。失败最多重试 3 次。"""
+            cname = file_info.get("name", f"chapter_{chapter_idx_s2+1}")
+            ctext = file_info.get("content", "")
+            chunks = DeepSeekService.smart_chunk_text(ctext, chunk_size)
+
+            async def _one_chunk(chunk_text: str) -> list:
+                async with sem:
+                    relevant = []
+                    for mem in active_memories:
+                        mem_name = mem.get("name", "")
+                        if mem_name and mem_name in chunk_text:
+                            relevant.append(mem)
+                        elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
+                            relevant.append(mem)
+                    mem_ctx = "【全局世界观与当前段落相关的记忆词条】\n"
+                    for rm in relevant:
+                        mem_ctx += f"- [{rm.get('category', '设定')}] {rm.get('name', '')}: {rm.get('lore', '')}\n"
+                    return await asyncio.to_thread(
+                        DeepSeekService.generate_scenes_for_chunk, chunk_text, mem_ctx
+                    )
+
+            MAX_RETRY = 3
+            for attempt in range(1, MAX_RETRY + 1):
+                try:
+                    chunk_results = await asyncio.gather(
+                        *[_one_chunk(c) for c in chunks],
+                        return_exceptions=True
+                    )
+                    chapter_scenes = []
+                    errors = 0
+                    for res in chunk_results:
+                        if isinstance(res, list) and res:
+                            chapter_scenes.extend(res)
+                        elif isinstance(res, Exception):
+                            errors += 1
+                            logger.warning(f"[Stage2][{cname}] 切片异常: {res}")
+
+                    if chapter_scenes:
+                        logger.info(f"✅ [Stage2][{cname}] 第{attempt}次: {len(chapter_scenes)} 个分镜 ({errors} 块失败)")
+                        return chapter_scenes, cname
+                    else:
+                        logger.warning(f"⚠️ [Stage2][{cname}] 第{attempt}次全部失败, {'retry' if attempt < MAX_RETRY else '放弃'}…")
+                        if attempt < MAX_RETRY:
+                            await asyncio.sleep(2 * attempt)  # 退让步 2s/4s
+                except Exception as e:
+                    logger.error(f"❌ [Stage2][{cname}] 第{attempt}次异常: {e}")
+                    if attempt < MAX_RETRY:
+                        await asyncio.sleep(2 * attempt)
+
+            logger.error(f"🔴 [Stage2][{cname}] 重试 {MAX_RETRY} 次均失败，该章节将被跳过")
+            return [], cname
+
+        logger.info(f"🎦 [Stage2] 开始严格顺序处理 {len(files)} 个章节 (每章内 Semaphore(3) 并发切片)")
+        from core.protocols.render_protocol import RenderProtocol
+
+        for ch_idx, file_info in enumerate(files):
+            chapter_scenes, chapter_name_s2 = await _stage2_chapter(file_info, ch_idx)
+            if not chapter_scenes:
+                logger.warning(f"⚠️ [Stage2] {file_info.get('name')} 无分镜输出，跳过写入")
+                continue
+
+            # 视觉提示词 RenderProtocol 注入
+            for scene in chapter_scenes:
+                prompt_raw = scene.get("master_prompt", scene.get("visual_prompt", ""))
+                if isinstance(prompt_raw, dict):
+                    prompt_raw = "\n".join(f"{k}: {v}" for k, v in prompt_raw.items())
+                scene["visual_prompt"] = RenderProtocol.inject_render_config(
+                    str(prompt_raw),
+                    {**video_params, **{"_sandbox_mode": True}} if sandbox_mode else video_params,
+                    gateway
                 )
 
-        logger.info(f"🎬 [Stage2] 并发生成分镜，共 {len(all_chunks)} 块，并发度=3")
-        results = await asyncio.gather(
-            *[_stage2_chunk(c, cn, i) for i, (c, cn) in enumerate(all_chunks)],
-            return_exceptions=True
-        )
+            # 序号保证连续递增（episode_counter 跨章节共享）
+            start_ep = episode_counter[0]
+            episode_counter[0] += len(chapter_scenes)
 
-        for i, res in enumerate(results):
-            if isinstance(res, list) and res:
-                all_scenes.extend(res)
-            elif isinstance(res, Exception):
-                logger.error(f"[Stage2] 块 {i} 异常: {res}")
-
-        if not all_scenes:
-            return {"status": "error", "message": "所有分批块均未返回分镜", "novel_id": novel_id}
-
-        for idx, scene in enumerate(all_scenes):
-            scene["_episode"] = idx + 1
-
-        inserted_ids = self.bitable.insert_new_parsed_scenes(all_scenes, 1, task_id)
-        logger.info(f"🎉 批量流水线完成: novel_id={novel_id}, 分镜={len(all_scenes)}, 写入={len(inserted_ids)}")
+            ids = self.bitable.insert_new_parsed_scenes(
+                chapter_scenes,
+                episode_start=start_ep,
+                task_id=task_id,
+                sandbox_mode=sandbox_mode,
+                novel_id=novel_id,
+                chapter_name=chapter_name_s2,
+                gateway=gateway,
+            )
+            all_scenes.extend(chapter_scenes)
+            logger.info(f"📌 [Stage2] {chapter_name_s2} 写入 {len(ids)} 条，集数 {start_ep}~{episode_counter[0]-1}")
+            if on_progress:
+                await on_progress("stage2", ch_idx + 1, len(files), chapter_name_s2, "success")
         return {
             "status": "success",
             "novel_id": novel_id,

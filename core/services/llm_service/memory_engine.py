@@ -47,32 +47,19 @@ class MemoryEngine:
     # 核心 Diff 算法
     # ------------------------------------------------------------------
     @staticmethod
-    def local_diff(existing: dict, new_entries: list) -> dict:
+    def local_diff(existing: dict, new_entries: list,
+                   chapter_name: str = "") -> dict:
         """
         在内存中执行增量差分，不发出任何网络请求。
 
+        v2.7: 新增 chapter_name 参数，对每个 UPDATE 词条追加
+              「历史变更记录」[ch_X] 摘要条目和
+              「last_update_chapter」追加模式（分号隔开历史）。
+
         Args:
             existing: get_memories_by_novel() 返回的 Dict
-                      key = entity_id
-                      value = {"record_id": str, "fields": {...}}
-            new_entries: DeepSeek delta_extract 返回的列表，每条格式:
-                {
-                  "action":      "INSERT" | "UPDATE" | "ARCHIVE",
-                  "entity_id":   str (可选，INSERT 时由引擎生成),
-                  "novel_id":    str,
-                  "category":    str,
-                  "name":        str,
-                  "lore":        str,
-                  "visual_aura": str,
-                  "reason":      str (ARCHIVE 时填写原因),
-                }
-
-        Returns:
-            {
-              "update":  [(record_id, feishu_field_dict), ...],
-              "insert":  [feishu_field_dict, ...],
-              "archive": [(record_id, {"status": "废弃"}), ...],
-            }
+            new_entries: DeepSeek delta_extract 返回的列表
+            chapter_name: 当前处理章节名（用于历史字段）
         """
         result = {"update": [], "insert": [], "archive": []}
 
@@ -82,7 +69,7 @@ class MemoryEngine:
             novel_id = entry.get("novel_id", "")
             name = entry.get("name", "")
 
-            # entity_id 兜底生成（与 feishu_bitable 规则一致）
+            # entity_id 兼底生成（与 feishu_bitable 规则一致）
             if not entity_id and novel_id and name:
                 entity_id = f"e_{hashlib.sha1(f'{novel_id}:{name}'.encode()).hexdigest()[:8]}"
 
@@ -111,20 +98,43 @@ class MemoryEngine:
             if action == "UPDATE":
                 rec = existing.get(entity_id)
                 if rec:
-                    # 检查人类干预锁：如果飞书中状态被修改为“锁定”，则放弃 AI 的 UPDATE 提议
+                    # 检查人类干预锁：如果飞书中状态被修改为"锁定"，则放弃 AI 的 UPDATE 提议
                     if rec["fields"].get("status") == "锁定":
                         logger.info(f"[local_diff] 🔒 UPDATE 跳过: 词条 '{name}' 已被人工锁定")
                         continue
-                    
+
                     # version 自增
                     old_version = rec["fields"].get("version", 1)
                     feishu_fields["version"] = old_version + 1
+
+                    # last_update_chapter: 追加模式（保留完整历史）
+                    if chapter_name:
+                        old_chap = rec["fields"].get("last_update_chapter", "")
+                        if isinstance(old_chap, list):
+                            old_chap = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_chap)
+                        existing_chapters = [c.strip() for c in old_chap.split(";") if c.strip()] if old_chap else []
+                        if chapter_name not in existing_chapters:
+                            existing_chapters.append(chapter_name)
+                        feishu_fields["last_update_chapter"] = ";".join(existing_chapters)
+
+                    # 历史变更记录: 追加本次变化摘要
+                    if chapter_name:
+                        old_log = rec["fields"].get("历史变更记录", "")
+                        if isinstance(old_log, list):
+                            old_log = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_log)
+                        lore_snippet = (entry.get("lore", "") or "")[:60].replace("\n", " ")
+                        new_entry = f"[{chapter_name}] v{old_version+1}: {lore_snippet}"
+                        feishu_fields["历史变更记录"] = (old_log + "; " + new_entry).strip("; ") if old_log else new_entry
+
                     result["update"].append((rec["record_id"], feishu_fields))
                     logger.debug(f"[local_diff] UPDATE: {name} (v{old_version} → v{old_version+1})")
                 else:
                     # entity_id 在现有库未找到，降级为 INSERT
                     logger.warning(f"[local_diff] UPDATE 目标 {entity_id} 不存在，降级为 INSERT")
                     feishu_fields["version"] = 1
+                    if chapter_name:
+                        feishu_fields["last_update_chapter"] = chapter_name
+                        feishu_fields["历史变更记录"] = f"[{chapter_name}] v1: 新建"
                     result["insert"].append(feishu_fields)
             else:  # INSERT
                 # 防重名：若同名词条已存在，改为 UPDATE
@@ -139,9 +149,25 @@ class MemoryEngine:
                     old_version = name_match["fields"].get("version", 1)
                     feishu_fields["version"] = old_version + 1
                     feishu_fields["status"] = "进化"
+                    if chapter_name:
+                        old_chap = name_match["fields"].get("last_update_chapter", "")
+                        if isinstance(old_chap, list):
+                            old_chap = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_chap)
+                        existing_chapters = [c.strip() for c in old_chap.split(";") if c.strip()] if old_chap else []
+                        if chapter_name not in existing_chapters:
+                            existing_chapters.append(chapter_name)
+                        feishu_fields["last_update_chapter"] = ";".join(existing_chapters)
+                        old_log = name_match["fields"].get("历史变更记录", "")
+                        if isinstance(old_log, list):
+                            old_log = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_log)
+                        new_entry_log = f"[{chapter_name}] v{old_version+1}: 重名诏异INSERT转UPDATE"
+                        feishu_fields["历史变更记录"] = (old_log + "; " + new_entry_log).strip("; ") if old_log else new_entry_log
                     result["update"].append((name_match["record_id"], feishu_fields))
                 else:
                     feishu_fields["version"] = 1
+                    if chapter_name:
+                        feishu_fields["last_update_chapter"] = chapter_name
+                        feishu_fields["历史变更记录"] = f"[{chapter_name}] v1: 新建"
                     result["insert"].append(feishu_fields)
 
         logger.info(
@@ -238,8 +264,8 @@ class MemoryEngine:
 
         logger.info(f"🔍 [MemoryEngine] DeepSeek 输出 {len(new_entries)} 条变更指令")
 
-        # Step 4: 本地 Diff（零网络开销）
-        diff = MemoryEngine.local_diff(existing, new_entries)
+        # Step 4: 本地 Diff（零网络开销）—传入 chapter_name 以追加历史
+        diff = MemoryEngine.local_diff(existing, new_entries, chapter_name=chapter_name)
 
         # Step 5: 事务性写回飞书
         update_ok = 0
@@ -248,19 +274,12 @@ class MemoryEngine:
         write_error = False
 
         if diff["update"]:
-            # 补充 last_update_chapter
-            for i, (rid, fields) in enumerate(diff["update"]):
-                fields["last_update_chapter"] = chapter_name
-                diff["update"][i] = (rid, fields)
             update_ok = bitable.batch_update_memories(diff["update"])
             if update_ok == 0 and diff["update"]:
                 logger.error("[MemoryEngine] batch_update_memories 全部失败")
                 write_error = True
 
         if diff["insert"] and not write_error:
-            # 补充 last_update_chapter
-            for fields in diff["insert"]:
-                fields["last_update_chapter"] = chapter_name
             insert_ids = bitable.batch_create_memories(diff["insert"])
             if not insert_ids and diff["insert"]:
                 logger.error("[MemoryEngine] batch_create_memories 全部失败")
