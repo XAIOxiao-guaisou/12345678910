@@ -322,12 +322,51 @@ class PipelineOrchestrator:
                 gateway=gateway,
             )
             all_scenes.extend(chapter_scenes)
-            # 收集视觉提示词（仅非 sandbox 行才入视频奡列）
+            # === Scene-Asset \u7ed1\u5b9a\uff1a\u4e3a i2v \u6a21\u5f0f\u67e5\u8be2\u5206\u955c\u5bf9\u5e94\u7684\u5b9e\u4f53\u56fe\u7247 URL ===
             if not sandbox_mode:
+                # \u6536\u96c6\u672c\u7ae0\u6240\u6709\u5206\u955c\u7684\u72ec\u7acb entity_id
+                chapter_entity_ids = set()
+                for sc in chapter_scenes:
+                    for eid in (sc.get("entity_ids") or []):
+                        if eid:
+                            chapter_entity_ids.add(str(eid))
+
+                # \u5e76\u53d1\u4ece\u98de\u4e66\u7d20\u6750\u8868\u67e5\u8be2\u5bf9\u5e94\u5b9e\u4f53\u7684\u56fe\u7247 URL
+                asset_cache: dict = {}
+                if chapter_entity_ids:
+                    async def _fetch_one(eid: str):
+                        a = await asyncio.to_thread(
+                            self.bitable.get_asset_by_entity, eid, novel_id
+                        )
+                        url = a.get("image_url", "") if a.get("found") else ""
+                        return eid, url
+
+                    fetch_results = await asyncio.gather(
+                        *[_fetch_one(eid) for eid in chapter_entity_ids],
+                        return_exceptions=True,
+                    )
+                    asset_cache = {
+                        eid: url
+                        for eid, url in fetch_results
+                        if not isinstance((eid, url), Exception) and isinstance(url, str) and url
+                    }
+                    logger.info(
+                        f"\ud83d\uddbc\ufe0f [Stage3-Bind] {chapter_name_s2}: "
+                        f"{len(asset_cache)}/{len(chapter_entity_ids)} \u4e2a\u5b9e\u4f53\u5339\u914d\u5230\u56fe\u7247"
+                    )
+
+                # \u6253\u5305 (prompt, image_url) \u5143\u7ec4\uff1b\u65e0\u56fe\u964d\u7ea7\u4e3a\u7eaf prompt\uff08t2v fallback\uff09
                 for sc in chapter_scenes:
                     vp = sc.get("visual_prompt", "")
-                    if vp and isinstance(vp, str) and len(vp) > 10:
-                        all_visual_prompts.append(vp)
+                    if not (vp and isinstance(vp, str) and len(vp) > 10):
+                        continue
+                    image_url = ""
+                    for eid in (sc.get("entity_ids") or []):
+                        if str(eid) in asset_cache:
+                            image_url = asset_cache[str(eid)]
+                            break
+                    all_visual_prompts.append((vp, image_url) if image_url else vp)
+
             logger.info(f"📌 [Stage2] {chapter_name_s2} 写入 {len(ids)} 条，集数 {start_ep}~{episode_counter[0]-1}")
             if on_progress:
                 await on_progress("stage2", ch_idx + 1, len(files), chapter_name_s2, "success")
