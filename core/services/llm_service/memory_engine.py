@@ -48,7 +48,7 @@ class MemoryEngine:
     # ------------------------------------------------------------------
     @staticmethod
     def local_diff(existing: dict, new_entries: list,
-                   chapter_name: str = "") -> dict:
+                   chapter_name: str = "", chapter_index: int = 0) -> dict:
         """
         在内存中执行增量差分，不发出任何网络请求。
 
@@ -103,9 +103,43 @@ class MemoryEngine:
                         logger.info(f"[local_diff] 🔒 UPDATE 跳过: 词条 '{name}' 已被人工锁定")
                         continue
 
-                    # version 自增
-                    old_version = rec["fields"].get("version", 1)
-                    feishu_fields["version"] = old_version + 1
+                    is_present = entry.get("present_in_current", True)
+                    
+                    if is_present:
+                        # 只有正式出场，才自增 Version
+                        old_version = rec["fields"].get("version", 1)
+                        feishu_fields["version"] = old_version + 1
+                        
+                        feishu_fields["last_seen_chapter"] = chapter_name
+                        feishu_fields["last_seen_chapter_idx"] = chapter_index
+                        
+                        # 原子化追加章节轨迹
+                        old_trace = rec["fields"].get("章节轨迹", "")
+                        if isinstance(old_trace, list):
+                            old_trace = "".join(seg.get("text", "") if isinstance(seg, dict) else str(seg) for seg in old_trace)
+                        trace_list = [t.strip() for t in str(old_trace).split(",") if t.strip()] if old_trace else []
+                        if chapter_name and chapter_name not in trace_list:
+                            trace_set = set(trace_list)
+                            trace_set.add(chapter_name)
+                            # 为了保持唯一性与顺序性，虽然 set 破坏了原始顺序，但因为我们是递增追加的，通常按插入即可。为了鲁棒，可以直接追在末尾。
+                            # 这里简单的去重+时序保持
+                            new_trace_list = []
+                            for t in trace_list:
+                                if t not in new_trace_list: new_trace_list.append(t)
+                            if chapter_name not in new_trace_list:
+                                new_trace_list.append(chapter_name)
+                            feishu_fields["章节轨迹"] = ",".join(new_trace_list)
+                        
+                    else:
+                        # 仅探测心跳，不用加 version
+                        old_version = rec["fields"].get("version", 1)  # 保持原样以供后续 log 用
+                        feishu_fields["version"] = old_version
+                        feishu_fields["status"] = "活跃"
+
+                    if entry.get("last_known_state"):
+                        feishu_fields["last_known_state"] = entry["last_known_state"]
+                    if entry.get("implicit_carry"):
+                        feishu_fields["implicit_carry"] = entry["implicit_carry"]
 
                     # last_update_chapter: 追加模式（保留完整历史）
                     if chapter_name:
@@ -132,6 +166,12 @@ class MemoryEngine:
                     # entity_id 在现有库未找到，降级为 INSERT
                     logger.warning(f"[local_diff] UPDATE 目标 {entity_id} 不存在，降级为 INSERT")
                     feishu_fields["version"] = 1
+                    feishu_fields["last_seen_chapter"] = chapter_name
+                    feishu_fields["last_seen_chapter_idx"] = chapter_index
+                    if chapter_name:
+                        feishu_fields["章节轨迹"] = chapter_name
+                    if entry.get("last_known_state"):
+                        feishu_fields["last_known_state"] = entry["last_known_state"]
                     if chapter_name:
                         feishu_fields["last_update_chapter"] = chapter_name
                         feishu_fields["历史变更记录"] = f"[{chapter_name}] v1: 新建"
@@ -165,6 +205,12 @@ class MemoryEngine:
                     result["update"].append((name_match["record_id"], feishu_fields))
                 else:
                     feishu_fields["version"] = 1
+                    feishu_fields["last_seen_chapter"] = chapter_name
+                    feishu_fields["last_seen_chapter_idx"] = chapter_index
+                    if chapter_name:
+                        feishu_fields["章节轨迹"] = chapter_name
+                    if entry.get("last_known_state"):
+                        feishu_fields["last_known_state"] = entry["last_known_state"]
                     if chapter_name:
                         feishu_fields["last_update_chapter"] = chapter_name
                         feishu_fields["历史变更记录"] = f"[{chapter_name}] v1: 新建"
@@ -180,11 +226,10 @@ class MemoryEngine:
     # 摘要生成 (供 DeepSeek delta_extract 参考，节省 Token)
     # ------------------------------------------------------------------
     @staticmethod
-    def build_existing_summary(existing: dict, max_entries: int = 60) -> str:
+    def build_existing_summary(existing: dict, chapter_index: int = 0, max_entries: int = 60) -> str:
         """
-        将现有记忆库精简为 DeepSeek 可读的文本摘要。
-        自动过滤「废弃」词条（不占用 Token）。
-        max_entries 限制传入 DeepSeek 的最大词条数，防止超出 context 窗口。
+        记忆衰减摘要：若实体连续 10 章未出现(chapter_index - last_seen_chapter_idx >= 10)，
+        截断其 Lore 仅保留状态快照，节省 Token 也维持灵魂关联。
         """
         active = [
             v["fields"] for v in existing.values()
@@ -193,19 +238,41 @@ class MemoryEngine:
         if not active:
             return "（当前小说记忆库为空，请进行完整初始建档）"
 
-        # 截断保护
         if len(active) > max_entries:
             logger.warning(f"[MemoryEngine] 记忆词条 {len(active)} 条，截断至 {max_entries} 条供 Delta 参考")
             active = active[:max_entries]
 
-        lines = ["【现有记忆库摘要（仅供增量对比，勿重复创建）】"]
+        lines = ["【全量活跃实体池（当前库内已有活跃实体）：】"]
         for m in active:
             status_tag = f"[{m.get('status', '活跃')}]"
-            lines.append(
-                f"- {status_tag} [{m.get('category', '')}] "
-                f"{m.get('name', '')}（entity_id: {m.get('entity_id', 'N/A')}）: "
-                f"{m.get('lore', '')[:80]}"
-            )
+            
+            # 衰减判断
+            last_idx = m.get("last_seen_chapter_idx", chapter_index)
+            try:
+                last_idx = int(float(last_idx))
+            except:
+                last_idx = chapter_index
+
+            is_decayed = (chapter_index - last_idx) >= 10
+            
+            if is_decayed:
+                snapshot_state = m.get("last_known_state", "") or m.get("implicit_carry", "")
+                short_lore = f"（休眠衰减快照）{snapshot_state}" if snapshot_state else f"（休眠中）{m.get('lore', '')[:30]}..."
+                lines.append(
+                    f"- {status_tag} [{m.get('category', '')}] "
+                    f"{m.get('name', '')} (entity_id: {m.get('entity_id', '')}) | 最后出场: {m.get('last_seen_chapter', '?')} | "
+                    f"当前精简快照: {short_lore}"
+                )
+            else:
+                trace = str(m.get("章节轨迹", ""))
+                trace_snippet = f"（轨迹：{trace}）" if trace else ""
+                lines.append(
+                    f"- {status_tag} [{m.get('category', '')}] "
+                    f"{m.get('name', '')} {trace_snippet} (id: {m.get('entity_id', '')}) | "
+                    f"上一次活跃: {m.get('last_seen_chapter', '?')} | "
+                    f"视觉延续性约束: 必须在分镜中延续「{m.get('visual_aura', '')[:150].replace(chr(10), ' ')}」的美学特征 | "
+                    f"逻辑快照: {m.get('last_known_state', '') or m.get('lore', '')[:80].replace(chr(10), ' ')}"
+                )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -246,8 +313,8 @@ class MemoryEngine:
         existing = bitable.get_memories_by_novel(novel_id)
         logger.info(f"📚 [MemoryEngine] 预载完毕: {len(existing)} 条现有词条")
 
-        # Step 2: 生成摘要（自动过滤废弃词条）
-        existing_summary = MemoryEngine.build_existing_summary(existing)
+        # Step 2: 生成摘要（自动过滤废弃词条，应用衰减逻辑）
+        existing_summary = MemoryEngine.build_existing_summary(existing, chapter_index)
 
         # Step 3: DeepSeek Delta 提取
         try:
@@ -264,8 +331,8 @@ class MemoryEngine:
 
         logger.info(f"🔍 [MemoryEngine] DeepSeek 输出 {len(new_entries)} 条变更指令")
 
-        # Step 4: 本地 Diff（零网络开销）—传入 chapter_name 以追加历史
-        diff = MemoryEngine.local_diff(existing, new_entries, chapter_name=chapter_name)
+        # Step 4: 本地 Diff（零网络开销）—传入 chapter_name 和 chapter_index 以追踪心跳
+        diff = MemoryEngine.local_diff(existing, new_entries, chapter_name=chapter_name, chapter_index=chapter_index)
 
         # Step 5: 事务性写回飞书
         update_ok = 0

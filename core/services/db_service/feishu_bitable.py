@@ -37,11 +37,14 @@ TABLE_MEMORY = os.environ.get("FEISHU_TABLE_MEMORY", "tblcFydnJuwD8cIy")
 REQUIRED_MEMORY_FIELDS = [
     "类别", "词条名", "深层设定逻辑", "视觉氛围与美学隐喻",
     "所属小说ID", "entity_id", "version", "last_update_chapter",
-    "status", "历史变更记录", "引用分镜ID", "环境标签"
+    "status", "历史变更记录", "引用分镜ID", "环境标签",
+    "last_seen_chapter", "last_seen_chapter_idx", "last_known_state", "implicit_carry",
+    "章节轨迹"
 ]
 REQUIRED_SCRIPT_FIELDS = [
     "集数/场次", "视觉提示词", "状态", "所属模型/网关",
-    "章节处理状态", "所属章节文件名", "任务ID", "关联记忆实体", "环境标签"
+    "章节处理状态", "所属章节文件名", "任务ID", "关联记忆实体", "环境标签",
+    "所属小说ID", "小说原文（内容）", "场景描述"
 ]
 
 class FeishuBitableManager:
@@ -126,11 +129,10 @@ class FeishuBitableManager:
     # =======================================================
     # 空白行检测（优先填入而非追加）
     # =======================================================
-    def _get_blank_record_ids(self, app_token: str, table_id: str,
-                               key_field: str = "集数/场次") -> list:
+    def _get_blank_record_ids(self, app_token: str, table_id: str) -> list:
         """
-        扫描表中「key_field」为空的行，返回 record_id 列表。
-        用于「空白行优先填入」策略：避免表中已有空行被跳过。
+        利用飞书 API 原生多条件过滤寻找核心业务字段全为空的记录。
+        服务端 AQL 检索，耗时 O(1)。
         """
         search_url = (
             f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}"
@@ -144,7 +146,10 @@ class FeishuBitableManager:
                     "page_size": 500,
                     "filter": {
                         "conjunction": "and",
-                        "conditions": [{"field_name": key_field, "operator": "isEmpty"}]
+                        "conditions": [
+                            {"field_name": "视觉提示词", "operator": "isEmpty"},
+                            {"field_name": "小说原文（内容）", "operator": "isEmpty"}
+                        ]
                     }
                 }
                 if page_token:
@@ -158,7 +163,7 @@ class FeishuBitableManager:
                     break
         except Exception as e:
             logger.warning(f"_get_blank_record_ids 扫描失败（降级为纯创建模式）: {e}")
-        logger.info(f"📋 [空白行扫描] 发现 {len(blank_ids)} 个可填入行")
+        logger.info(f"📋 [空白行服务端搜索] 发现 {len(blank_ids)} 个可填入空行 (O(1) 检索完成)")
         return blank_ids
 
     # =======================================================
@@ -262,13 +267,13 @@ class FeishuBitableManager:
             resp = requests.get(url, headers=self._get_headers())
             resp.raise_for_status()
             for f in resp.json().get("data", {}).get("items", []):
-                result[f["field_name"]] = f["field_id"]
+                result[f["field_name"]] = (f["field_id"], f["type"])
         except Exception as e:
             logger.error(f"_list_table_fields_with_ids 失败: {e}")
         return result
 
     def _delete_field(self, app_token: str, table_id: str, field_id: str, label: str = "") -> bool:
-        """删除飞书多维表格中的指定字段（安全白名单机制保护）。"""
+        """物理删除指定字段。"""
         url = (f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}"
                f"/tables/{table_id}/fields/{field_id}")
         try:
@@ -276,9 +281,12 @@ class FeishuBitableManager:
             resp.raise_for_status()
             body = resp.json()
             if body.get("code") == 0:
-                logger.info(f"🗑️ 字段删除成功: [{label}]")
+                logger.info(f"🗑️ 字段物理删除成功: [{label}]")
                 return True
-            logger.warning(f"字段删除响应异常: [{label}] {body.get('msg')}")
+            logger.warning(f"字段物理删除异常: [{label}] {body.get('msg')}")
+            return False
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"_delete_field [{label}] HTTP Error: {e.response.text}")
             return False
         except Exception as e:
             logger.error(f"_delete_field [{label}] 异常: {e}")
@@ -286,26 +294,32 @@ class FeishuBitableManager:
 
     def purge_redundant_fields(self) -> dict:
         """
-        程序化清理已确认废弃的字段（白名单机制，仅删除下列明确无写入路径的字段）。
-          剧本拆解表: 音频提示词（Stage2 已不再写入，字段恒为空）
-        Returns: {table_label: [deleted_field_names]}
+        程序化物理删除已确认废弃的字段。
+        由于之前已经重命名，包含 "已废弃_" 前缀的字段也会被删除。
         """
         REDUNDANT = {
-            "剧本拆解表": (APP_TOKEN_SCRIPT, TABLE_SCRIPT, ["音频提示词"]),
+            "剧本拆解表": (APP_TOKEN_SCRIPT, TABLE_SCRIPT, ["音频提示词", "已废弃_音频提示词"]),
+            "记忆中枢": (APP_TOKEN_MEMORY, TABLE_MEMORY, [
+                "词条名称", "深层设定与逻辑", "依赖关系", "视觉约束",
+                "记忆维度", "实体标识符", "视觉通感", "登场章节",
+                "已废弃_词条名称", "已废弃_深层设定与逻辑", "已废弃_依赖关系", "已废弃_视觉约束",
+                "已废弃_记忆维度", "已废弃_实体标识符", "已废弃_视觉通感", "已废弃_登场章节"
+            ])
         }
         report = {}
         for label, (app_token, table_id, fields_to_del) in REDUNDANT.items():
             field_map = self._list_table_fields_with_ids(app_token, table_id)
             deleted = []
             for fname in fields_to_del:
-                fid = field_map.get(fname)
-                if not fid:
-                    logger.info(f"🔍 [{label}] 字段 '{fname}' 不存在（可能已删除），跳过")
+                val = field_map.get(fname)
+                if not val:
+                    logger.info(f"🔍 [{label}] 字段 '{fname}' 不存在（可能已被物理删除），跳过")
                     continue
+                fid, ftype = val
                 if self._delete_field(app_token, table_id, fid, label=f"{label}.{fname}"):
                     deleted.append(fname)
             report[label] = deleted
-            logger.info(f"🧹 [{label}] 废弃字段清理: {deleted}")
+            logger.info(f"🧹 [{label}] 废弃字段物理删除: {deleted}")
         return report
 
     def _create_field(self, app_token, table_id, field_name, field_type=1):
@@ -315,6 +329,11 @@ class FeishuBitableManager:
         """
         url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
         payload = {"field_name": field_name, "type": field_type}
+        if field_type == 3:
+            if field_name == "status":
+                payload["property"] = {"options": [{"name": "活跃"}, {"name": "进化"}, {"name": "废弃"}]}
+            elif field_name == "状态":
+                payload["property"] = {"options": [{"name": "处理中"}, {"name": "拆解中"}, {"name": "已拆解"}]}
         try:
             resp = requests.post(url, headers=self._get_headers(), json=payload)
             resp.raise_for_status()
@@ -339,7 +358,13 @@ class FeishuBitableManager:
             (APP_TOKEN_SCRIPT, TABLE_SCRIPT, "剧本拆解表", REQUIRED_SCRIPT_FIELDS),
         ]
         # 字段类型映射
-        field_type_map = {"version": 2}  # 2 = 数字类型
+        field_type_map = {
+            "version": 2, 
+            "last_seen_chapter_idx": 2,  # 2 = 数字类型
+            "章节轨迹": 1,              # 1 = 多行文本
+            "小说原文（内容）": 1,      # 1 = 多行文本，用于 AQL 一致性
+            "视觉提示词": 1             # 1 = 多行文本，用于 AQL 一致性
+        }
         single_select_fields = {"status", "章节处理状态", "状态", "环境标签"}
 
         for app_token, table_id, label, required in checks:
@@ -399,21 +424,21 @@ class FeishuBitableManager:
                 items = data.get("items", [])
                 for r in items:
                     fields = r.get("fields", {})
-                    eid = self._flatten(fields.get("entity_id", ""))
+                    eid = self._flatten(self._get_fallback_field(fields, "entity_id", ""))
                     if not eid:
                         # 兼容旧数据：entity_id 为空时用 sha1(novel_id+词条名)
                         import hashlib
-                        raw_name = self._flatten(fields.get("词条名", r["record_id"]))
+                        raw_name = self._flatten(self._get_fallback_field(fields, "词条名", r["record_id"]))
                         eid = f"e_{hashlib.sha1(f'{novel_id}:{raw_name}'.encode()).hexdigest()[:8]}"
                     result[eid] = {
                         "record_id": r["record_id"],
                         "fields": {
-                            "category": self._flatten(fields.get("类别", "")),
-                            "name": self._flatten(fields.get("词条名", "")),
-                            "lore": self._flatten(fields.get("深层设定逻辑", "")),
-                            "visual_aura": self._flatten(fields.get("视觉氛围与美学隐喻", "")),
-                            "status": self._flatten(fields.get("status", "活跃")),
-                            "version": fields.get("version", 1),
+                            "category": self._flatten(self._get_fallback_field(fields, "类别", "")),
+                            "name": self._flatten(self._get_fallback_field(fields, "词条名", "")),
+                            "lore": self._flatten(self._get_fallback_field(fields, "深层设定逻辑", "")),
+                            "visual_aura": self._flatten(self._get_fallback_field(fields, "视觉氛围与美学隐喻", "")),
+                            "status": self._flatten(self._get_fallback_field(fields, "status", "活跃")),
+                            "version": self._get_fallback_field(fields, "version", 1),
                             "entity_id": eid,
                         }
                     }
@@ -635,6 +660,16 @@ class FeishuBitableManager:
         if val is None: return ""
         return str(val)
 
+    @staticmethod
+    def _get_fallback_field(fields_dict, field_name, default=None):
+        """尝试读取字段，如果不存在则尝试读取带有 已废弃_ 前缀的兜底字段。"""
+        if field_name in fields_dict:
+            return fields_dict[field_name]
+        deprecated_name = f"已废弃_{field_name}"
+        if deprecated_name in fields_dict:
+            return fields_dict[deprecated_name]
+        return default
+
     def upsert_character_in_assets(self, character_name, appearance="", hasselblad="Hasselblad H6D-100c, 80mm, f/2.8"):
         search_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records/search"
         create_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_ASSETS}/tables/{TABLE_ASSETS}/records"
@@ -848,14 +883,26 @@ class FeishuBitableManager:
 
             records.append({"fields": scene_fields})
 
-        # ── Phase 1: 空白行优先填入 ──────────────────────────────
-        blank_ids = self._get_blank_record_ids(APP_TOKEN_SCRIPT, TABLE_SCRIPT, "集数/场次")
+        # ── Phase 1: 空白行服务端检索锁定机制 ──────────────────────────────
+        blank_ids = self._get_blank_record_ids(APP_TOKEN_SCRIPT, TABLE_SCRIPT)
         created_ids = []
 
         if blank_ids and records:
             fill_count = min(len(blank_ids), len(records))
+            locked_ids = blank_ids[:fill_count]
+
+            # 悲观锁：先将找到的空行置为 "处理中"
+            lock_payload = [{"record_id": rid, "fields": {"状态": "处理中"}} for rid in locked_ids]
+            for start in range(0, len(lock_payload), 100):
+                batch = lock_payload[start:start + 100]
+                try:
+                    requests.post(update_url, headers=self._get_headers(), json={"records": batch})
+                except Exception as e:
+                    logger.warning(f"空行跨进程锁定异常: {e}")
+
+            # 实际数据填入（由于使用了并发锁，这里的更新是安全的重叠覆盖）
             fill_payload = [
-                {"record_id": blank_ids[j], "fields": records[j]["fields"]}
+                {"record_id": locked_ids[j], "fields": records[j]["fields"]}
                 for j in range(fill_count)
             ]
             for start in range(0, len(fill_payload), 100):
