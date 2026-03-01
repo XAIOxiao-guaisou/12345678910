@@ -516,30 +516,58 @@ class PipelineOrchestrator:
             logger.error(f"不支持的网关模型类型: {gateway}")
             return
             
-        logger.info(f"收到 {len(prompts)} 个分镜，待接入 API 并行生成...")
-        
-        # We can fire them all asynchronously
+        logger.info(f"收到 {len(prompts)} 个分镜，开始限流并行视频生成 (Semaphore=3, 间隔 2s)...")
+
+        # 并发控制：Semaphore(3) 限制同时提交数
+        submit_sem = asyncio.Semaphore(3)
+
         async def submit_and_wait(prompt_text, idx):
-            try:
-                task_id = await video_api.submit_task(prompt_text)
-                logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
-                
-                # Poll loop
+            async with submit_sem:
+                # 提交间隔 — 防止 QPS 这突破
+                await asyncio.sleep((idx - 1) * 2)
+                for attempt in range(1, 4):  # 最多 3 次重试
+                    try:
+                        task_id = await video_api.submit_task(prompt_text)
+                        logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
+                        break
+                    except Exception as e:
+                        err_str = str(e)
+                        if "Throttling" in err_str and attempt < 3:
+                            wait = attempt * 10
+                            logger.warning(
+                                f"[Task {idx}] QPS 限流，{wait}秒后重试 "
+                                f"({attempt}/3)..."
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        logger.error(f"[Task {idx}] 提交失败: {e}")
+                        return None
+                else:
+                    logger.error(f"[Task {idx}] 重试 3 次均失败，放弃")
+                    return None
+
+                # 轮询状态
                 max_retries = 60
                 for _ in range(max_retries):
                     await asyncio.sleep(5)
-                    status_info = await video_api.check_status(task_id)
+                    try:
+                        status_info = await video_api.check_status(task_id)
+                    except Exception as se:
+                        logger.warning(f"[Task {idx}] 状态查询异常: {se}，继续轮询")
+                        continue
                     status = status_info.get("status")
-                    
+
                     if status == "succeeded":
                         video_url = status_info.get("video_url")
                         logger.info(f"[Task {idx}] 生成成功! 视频 URL: {video_url}")
 
-                        # P2: 下载逻辑 — 优先 Aria2c（断点续传），降级 aiohttp
+                        # 下载逻辑 — 优先 Aria2c，降级 aiohttp
                         download_dir = os.path.abspath(
-                            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Download")
+                            os.path.join(
+                                os.path.dirname(os.path.abspath(__file__)),
+                                "..", "Download"
+                            )
                         )
-                        # novel_id 通过任务闭包传入（如未传则为空）
                         _novel_id = getattr(self, "_current_novel_id", "")
                         try:
                             local_path = await Aria2cService.smart_download(
@@ -551,27 +579,26 @@ class PipelineOrchestrator:
                             logger.info(f"[Task {idx}] ✅ 视频已下载至本地: {local_path}")
                             return local_path
                         except Exception as dl_err:
-                            logger.error(f"[Task {idx}] 下载全部失败: {dl_err}")
-                            return video_url  # 最终降级：返回远端 URL 供人工处理
+                            logger.error(f"[Task {idx}] 下载失败: {dl_err}")
+                            return video_url
+
                     elif status == "failed":
-                        err = status_info.get("error")
-                        logger.error(f"[Task {idx}] 生成失败: {err}")
+                        logger.error(f"[Task {idx}] 生成失败: {status_info.get('error')}")
                         return None
-                    elif status in ["running", "queued"]:
-                        logger.info(f"[Task {idx}] 等待生成中... 状态: {status}")
-                        continue
+                    elif status in ("running", "queued"):
+                        logger.debug(f"[Task {idx}] 等待生成中... 状态: {status}")
                     else:
                         logger.warning(f"[Task {idx}] 未知状态: {status}")
                         return None
-                        
+
                 logger.error(f"[Task {idx}] 轮询超时")
                 return None
-            except Exception as e:
-                logger.error(f"[Task {idx}] 发生异常: {e}")
-                return None
-                
-        tasks = [submit_and_wait(p, i+1) for i, p in enumerate(prompts)]
-        results = await asyncio.gather(*tasks)
-        
-        success_count = sum(1 for r in results if r)
-        logger.info(f"🎉 视频生成批次结束！成功 {success_count}/{len(prompts)} 个。")
+
+        tasks = [submit_and_wait(p, i + 1) for i, p in enumerate(prompts)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success_count = sum(
+            1 for r in results if r and not isinstance(r, Exception)
+        )
+        logger.info(f"� 视频生成批次结束！成功 {success_count}/{len(prompts)} 个。")
+
