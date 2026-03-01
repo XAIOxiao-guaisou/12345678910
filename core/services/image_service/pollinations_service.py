@@ -13,6 +13,12 @@ import logging
 import random
 from typing import Optional
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()  # 自动读取项目根目录 .env 文件
+except ImportError:
+    pass  # python-dotenv 未安装时降级，静默依赖系统环境变量
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -41,8 +47,19 @@ class PollinationsService:
     RETRY_DELAY = 3.0       # 秒
 
     def __init__(self):
-        # POLLINATIONS_API_KEY 留空即走免费匿名通道
-        self.api_key: str = os.getenv("POLLINATIONS_API_KEY", "")
+        # 兼容多种命名规范：
+        #   POLLINATIONS_API_KEY  — 标准命名
+        #   pollinations.ai       — 用户原始方案命名
+        #   POLLINATIONS_KEY      — 简写兼容
+        self.api_key: str = (
+            os.getenv("POLLINATIONS_API_KEY", "")
+            or os.getenv("pollinations.ai", "")
+            or os.getenv("POLLINATIONS_KEY", "")
+        )
+        if self.api_key:
+            logger.info("✅ [Pollinations] API Key 已加载（授权模式）")
+        else:
+            logger.info("🔓 [Pollinations] 未配置 Key，走安全匹名通道")
 
     # ------------------------------------------------------------------
     # 核心生成接口
