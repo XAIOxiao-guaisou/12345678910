@@ -489,7 +489,7 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.error(f"无法初始化火山引擎 API 客户端: {e}")
                 return
-        elif "wan2.6" in gateway.lower() or "aliyun" in gateway.lower():
+        elif "wan2.6" in gateway.lower() or "wan_2_" in gateway.lower() or "aliyun" in gateway.lower():
             from core.services.video_service.aliyun_service import Wan2_6VideoAPI
             try:
                 # API Key will be read from OS env by default inside the class
