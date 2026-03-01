@@ -9,6 +9,7 @@ from core.services.db_service.feishu_bitable import FeishuBitableManager
 from core.services.llm_service.memory_engine import MemoryEngine
 from core.services.download_service.aria2c_service import Aria2cService
 from core.services.image_service.pollinations_service import PollinationsService
+from core.services.image_service.aliyun_image_service import AliyunImageService
 
 logger = logging.getLogger(__name__)
 
@@ -374,8 +375,19 @@ class PipelineOrchestrator:
         if not present_entities:
             return
 
-        pollinations = PollinationsService()
-        sem = asyncio.Semaphore(2)  # 防止 Pollinations 限流
+        # v2.7.1: 优先使用阿里云百炼 Wanx2.1（国内可达），Pollinations 作 fallback
+        aliyun_key = (
+            os.getenv("ALIYUN_API_KEY", "")
+            or os.getenv("DASHSCOPE_API_KEY", "")
+        )
+        if aliyun_key:
+            image_svc = AliyunImageService()
+            logger.info("🎨 [Stage1.5] 使用阿里云 Wanx2.1-t2i-turbo 生图")
+        else:
+            image_svc = PollinationsService()
+            logger.info("🎨 [Stage1.5] 使用 Pollinations.ai 生图（限国内网络）")
+
+        sem = asyncio.Semaphore(2)  # 防止并发过高限流
 
         async def _process_one(entity: dict):
             entity_id = entity["entity_id"]
@@ -422,14 +434,14 @@ class PipelineOrchestrator:
                     logger.warning(f"⚠️ [Stage1.5] {entity_name} Prompt 生成失败，跳过")
                     return
 
-                # Pollinations 生图（迭代时复用旧 seed）
+                # 生图（迭代时复用旧 seed，保持视觉 DNA 延续）
                 if is_evolution and old_seed:
-                    img_result = await pollinations.evolve_image(
+                    img_result = await image_svc.evolve_image(
                         original_seed=old_seed,
                         evolution_prompt=visual_prompt,
                     )
                 else:
-                    img_result = await pollinations.generate_image(
+                    img_result = await image_svc.generate_image(
                         prompt=visual_prompt,
                     )
 
