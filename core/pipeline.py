@@ -180,6 +180,7 @@ class PipelineOrchestrator:
 
         # === Stage1: 同 novel_id 内串行（章节相互依赖）===
         all_scenes = []
+        all_visual_prompts = []  # v2.7.0: 收集全量视觉提示词供视频生成调度
         for chapter_idx, file_info in enumerate(files):
             chapter_name = file_info.get("name", f"chapter_{chapter_idx+1}")
             chapter_text = file_info.get("content", "")
@@ -321,15 +322,38 @@ class PipelineOrchestrator:
                 gateway=gateway,
             )
             all_scenes.extend(chapter_scenes)
+            # 收集视觉提示词（仅非 sandbox 行才入视频奡列）
+            if not sandbox_mode:
+                for sc in chapter_scenes:
+                    vp = sc.get("visual_prompt", "")
+                    if vp and isinstance(vp, str) and len(vp) > 10:
+                        all_visual_prompts.append(vp)
             logger.info(f"📌 [Stage2] {chapter_name_s2} 写入 {len(ids)} 条，集数 {start_ep}~{episode_counter[0]-1}")
             if on_progress:
                 await on_progress("stage2", ch_idx + 1, len(files), chapter_name_s2, "success")
+        # === Stage3: 视频生成调度（生产模式且有分镜时自动派发）===
+        if not sandbox_mode and all_visual_prompts:
+            logger.info(
+                f"🎥 [Stage3] 生产模式开启，自动派发视频生成: {len(all_visual_prompts)} 个分镜 → gateway={gateway}"
+            )
+            asyncio.create_task(
+                self.run_video_generation(
+                    account=novel_id,
+                    prompts=all_visual_prompts,
+                    gateway=gateway,
+                )
+            )
+        elif sandbox_mode:
+            logger.info("📦 [沿箱模式] 视频生成未派发（sandbox_mode=True）")
+        else:
+            logger.warning("⚠️ [Stage3] 没有收集到分镜提示词，跳过视频派发")
+
         return {
             "status": "success",
             "novel_id": novel_id,
             "files": len(files),
             "scenes": len(all_scenes),
-            "inserted": len(inserted_ids),
+            "inserted": len(all_visual_prompts),
         }
     
     async def _run_stage1_5(
