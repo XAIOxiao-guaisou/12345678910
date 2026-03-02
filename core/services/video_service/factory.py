@@ -13,5 +13,9 @@ GATEWAY_REGISTRY = {
     "seedance-1.5-pro": {
         "class": VolcengineVideoAPI,
         "schema": DefaultParams,
+    },
+    "seedance-1.0-pro-fast": {
+        "class": VolcengineVideoAPI,
+        "schema": DefaultParams,
     }
 }

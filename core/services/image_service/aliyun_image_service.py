@@ -115,14 +115,37 @@ class AliyunImageService:
                 check_headers = {
                     "Authorization": f"Bearer {self.api_key}",
                 }
+                strike_count = 0
+                max_strikes = 5
+
                 for attempt in range(self.MAX_POLL):
                     await asyncio.sleep(self.POLL_INTERVAL)
-                    async with session.get(
-                        self.TASK_URL.format(task_id=task_id),
-                        headers=check_headers,
-                        timeout=aiohttp.ClientTimeout(total=30),
-                    ) as poll_resp:
-                        poll_data = await poll_resp.json()
+                    try:
+                        async with session.get(
+                            self.TASK_URL.format(task_id=task_id),
+                            headers=check_headers,
+                            timeout=aiohttp.ClientTimeout(total=20),
+                        ) as poll_resp:
+                            if poll_resp.status in (502, 503, 504) or poll_resp.status >= 500:
+                                raise aiohttp.ClientResponseError(
+                                    poll_resp.request_info, 
+                                    poll_resp.history, 
+                                    status=poll_resp.status, 
+                                    message="Gateway/Server Error"
+                                )
+                            poll_data = await poll_resp.json()
+                            strike_count = 0 # reset strikes on success
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        strike_count += 1
+                        wait_sec = min(5 * (2 ** strike_count), 60)
+                        logger.warning(
+                            f"📡 [AliyunImage] 轮询网络异常 ({e.__class__.__name__}): {e}, "
+                            f"strike={strike_count}/{max_strikes}, 退避 {wait_sec} 秒"
+                        )
+                        if strike_count >= max_strikes:
+                            return {"status": "error", "error": f"连续轮询失败超限: {e}"}
+                        await asyncio.sleep(wait_sec)
+                        continue
 
                     output = poll_data.get("output", {})
                     task_status = output.get("task_status", "UNKNOWN")

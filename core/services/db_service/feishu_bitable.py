@@ -44,7 +44,7 @@ REQUIRED_MEMORY_FIELDS = [
 REQUIRED_SCRIPT_FIELDS = [
     "集数/场次", "视觉提示词", "状态", "所属模型/网关",
     "章节处理状态", "所属章节文件名", "任务ID", "关联记忆实体", "环境标签",
-    "所属小说ID", "小说原文（内容）", "场景描述"
+    "所属小说ID", "小说原文（内容）", "场景描述", "情绪流转", "转场提示", "结尾钩子"
 ]
 # v2.7.0: 素材生成表（视觉锚定系统）
 REQUIRED_FACTORY_FIELDS = [
@@ -135,14 +135,19 @@ class FeishuBitableManager:
     # 空白行检测（优先填入而非追加）
     # =======================================================
     @staticmethod
-    def _is_record_truly_empty(record: dict) -> bool:
+    def _is_record_truly_empty(record: dict, table_id: str = "") -> bool:
         """
         本地二次校验：对服务端 AQL `isEmpty` 返回的候选行做精确验证。
-        飞书富文本字段 `isEmpty` 有时会将「含格式但无文本」的单元格漏过，
-        此处通过 flatten 文本后 strip 来最终确认是否真正为空白行。
         """
         fields = record.get("fields", {})
-        for key in ("视觉提示词", "小说原文（内容）"):
+        
+        check_keys = ("视觉提示词", "小说原文（内容）")
+        if table_id == os.environ.get("FEISHU_TABLE_FACTORY", "tbloUrdwqG47ZmgI"):
+            check_keys = ("视觉描述（英文Prompt）", "图片URL")
+        elif table_id == os.environ.get("FEISHU_TABLE_MEMORY", "tblcFydnJuwD8cIy"):
+            check_keys = ("词条名", "所属小说ID")
+
+        for key in check_keys:
             val = fields.get(key, "")
             if isinstance(val, list):
                 val = "".join(
@@ -167,14 +172,28 @@ class FeishuBitableManager:
         page_token = None
         try:
             while True:
+                
+                filter_conditions = []
+                if table_id == TABLE_FACTORY:
+                    filter_conditions = [
+                        {"field_name": "视觉描述（英文Prompt）", "operator": "isEmpty", "value": []},
+                        {"field_name": "图片URL", "operator": "isEmpty", "value": []}
+                    ]
+                elif table_id == TABLE_MEMORY:
+                    filter_conditions = [
+                        {"field_name": "词条名", "operator": "isEmpty", "value": []}
+                    ]
+                else:
+                    filter_conditions = [
+                        {"field_name": "视觉提示词", "operator": "isEmpty", "value": []},
+                        {"field_name": "小说原文（内容）", "operator": "isEmpty", "value": []}
+                    ]
+
                 payload = {
                     "page_size": 500,
                     "filter": {
                         "conjunction": "and",
-                        "conditions": [
-                            {"field_name": "视觉提示词", "operator": "isEmpty"},
-                            {"field_name": "小说原文（内容）", "operator": "isEmpty"}
-                        ]
+                        "conditions": filter_conditions
                     }
                 }
                 if page_token:
@@ -185,7 +204,7 @@ class FeishuBitableManager:
                 # 二次本地校验：过滤掉 AQL 误判的「假空行」
                 candidates = data.get("items", [])
                 server_count = len(candidates)
-                truly_blank = [r for r in candidates if self._is_record_truly_empty(r)]
+                truly_blank = [r for r in candidates if self._is_record_truly_empty(r, table_id=table_id)]
                 filtered_out = server_count - len(truly_blank)
                 if filtered_out > 0:
                     logger.info(f"🔍 [空白行二次校验] 服务端返回 {server_count} 条，本地过滤掉 {filtered_out} 条假空行")
@@ -897,6 +916,12 @@ class FeishuBitableManager:
                 "视觉提示词": visual_prompt,
                 "环境标签": env_label,
             }
+            if "emotion" in scene:
+                scene_fields["情绪流转"] = str(scene.get("emotion", ""))
+            if "camera" in scene:
+                scene_fields["转场提示"] = str(scene.get("camera", ""))
+            if "hook" in scene:
+                scene_fields["结尾钩子"] = str(scene.get("hook", ""))
             if task_id:
                 scene_fields["任务ID"] = task_id
             if novel_id:
@@ -1225,7 +1250,7 @@ class FeishuBitableManager:
             "素材类型": asset_type,
             "视觉描述（英文Prompt）": visual_prompt,
             "图片URL": image_url,
-            "Seed值": seed,
+            "Seed值": str(seed),
             "章节标签": chapter_tag,
             "生成状态": "已生成",
         }

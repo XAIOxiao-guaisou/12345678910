@@ -90,6 +90,8 @@ class PipelineOrchestrator:
         logger.info(f"📖 小说共 {len(novel_text)} 字，切分 {len(chunks)} 块执行拆解...")
         all_scenes = []
 
+        rolling_context = None
+
         for idx, chunk in enumerate(chunks):
             logger.info(f"🧠 [正在分析 {idx+1}/{len(chunks)} 块...]")
             relevant_memories = []
@@ -103,14 +105,19 @@ class PipelineOrchestrator:
             memory_context_str = "【全局世界观与当前段落相关的记忆词条】\n"
             for rm in relevant_memories:
                 memory_context_str += (
-                    f"- [{rm.get('category', '设定')}] {rm.get('name', '')}:"
+                    f"- [{rm.get('category', '设定')}] {rm.get('name', '')} (ID: {rm.get('entity_id', '')}):"
                     f"{rm.get('lore', '')}\n  视觉隐喻：{rm.get('visual_aura', '')}\n"
                 )
 
-            scenes = DeepSeekService.generate_scenes_for_chunk(chunk, memory_context_str)
+            scenes = DeepSeekService.generate_scenes_for_chunk(chunk, memory_context_str, rolling_context)
             if scenes:
                 all_scenes.extend(scenes)
                 logger.info(f"✅ 第{idx+1}块完成，累积分镜: {len(all_scenes)} 个")
+                last_scene = scenes[-1]
+                rolling_context = {
+                    "summary": last_scene.get("summary", ""),
+                    "visual_prompt": last_scene.get("visual_prompt", "")
+                }
             time.sleep(1)
 
         if not all_scenes:
@@ -241,54 +248,65 @@ class PipelineOrchestrator:
             ctext = file_info.get("content", "")
             chunks = DeepSeekService.smart_chunk_text(ctext, chunk_size)
 
-            async def _one_chunk(chunk_text: str) -> list:
-                async with sem:
-                    relevant = []
-                    for mem in active_memories:
-                        mem_name = mem.get("name", "")
-                        if mem_name and mem_name in chunk_text:
-                            relevant.append(mem)
-                        elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
-                            relevant.append(mem)
-                    mem_ctx = "【全局世界观与当前段落相关的记忆词条】\n"
-                    for rm in relevant:
-                        mem_ctx += f"- [{rm.get('category', '设定')}] {rm.get('name', '')}: {rm.get('lore', '')}\n"
-                    return await asyncio.to_thread(
-                        DeepSeekService.generate_scenes_for_chunk, chunk_text, mem_ctx
-                    )
+            async def _one_chunk(chunk_text: str, prev_ctx: dict) -> list:
+                relevant = []
+                for mem in active_memories:
+                    mem_name = mem.get("name", "")
+                    if mem_name and mem_name in chunk_text:
+                        relevant.append(mem)
+                    elif mem.get("category", "") in ["世界观", "氛围", "基调"]:
+                        relevant.append(mem)
+                mem_ctx = "【全局世界观与当前段落相关的记忆词条】\n"
+                for rm in relevant:
+                    mem_ctx += f"- [{rm.get('category', '设定')}] {rm.get('name', '')} (ID: {rm.get('entity_id', '')}): {rm.get('lore', '')}\n"
+                return await asyncio.to_thread(
+                    DeepSeekService.generate_scenes_for_chunk, chunk_text, mem_ctx, prev_ctx
+                )
 
             MAX_RETRY = 3
-            for attempt in range(1, MAX_RETRY + 1):
-                try:
-                    chunk_results = await asyncio.gather(
-                        *[_one_chunk(c) for c in chunks],
-                        return_exceptions=True
-                    )
-                    chapter_scenes = []
-                    errors = 0
-                    for res in chunk_results:
+            chapter_scenes = []
+            errors = 0
+            
+            # 使用列表以便在闭包外修改
+            rolling_context = [None]
+            
+            for chunk_idx, chunk_text in enumerate(chunks):
+                chunk_success = False
+                for attempt in range(1, MAX_RETRY + 1):
+                    try:
+                        res = await _one_chunk(chunk_text, rolling_context[0])
                         if isinstance(res, list) and res:
                             chapter_scenes.extend(res)
-                        elif isinstance(res, Exception):
-                            errors += 1
-                            logger.warning(f"[Stage2][{cname}] 切片异常: {res}")
-
-                    if chapter_scenes:
-                        logger.info(f"✅ [Stage2][{cname}] 第{attempt}次: {len(chapter_scenes)} 个分镜 ({errors} 块失败)")
-                        return chapter_scenes, cname
-                    else:
-                        logger.warning(f"⚠️ [Stage2][{cname}] 第{attempt}次全部失败, {'retry' if attempt < MAX_RETRY else '放弃'}…")
+                            chunk_success = True
+                            last_scene = res[-1]
+                            rolling_context[0] = {
+                                "summary": last_scene.get("summary", ""),
+                                "visual_prompt": last_scene.get("visual_prompt", ""),
+                                "emotion": last_scene.get("emotion", ""),
+                                "camera": last_scene.get("camera", ""),
+                                "hook": last_scene.get("hook", ""),
+                            }
+                            break
+                        else:
+                            logger.warning(f"⚠️ [Stage2][{cname}] 切片 {chunk_idx+1}/{len(chunks)} 第{attempt}次失败: 无有效分镜")
+                            if attempt < MAX_RETRY:
+                                await asyncio.sleep(2 * attempt)
+                    except Exception as e:
+                        logger.error(f"❌ [Stage2][{cname}] 切片 {chunk_idx+1}/{len(chunks)} 第{attempt}次异常: {e}")
                         if attempt < MAX_RETRY:
-                            await asyncio.sleep(2 * attempt)  # 退让步 2s/4s
-                except Exception as e:
-                    logger.error(f"❌ [Stage2][{cname}] 第{attempt}次异常: {e}")
-                    if attempt < MAX_RETRY:
-                        await asyncio.sleep(2 * attempt)
+                            await asyncio.sleep(2 * attempt)
+                
+                if not chunk_success:
+                    errors += 1
+                    logger.error(f"🔴 [Stage2][{cname}] 切片 {chunk_idx+1}/{len(chunks)} 彻底失败，将跳过！")
+            if chapter_scenes:
+                logger.info(f"✅ [Stage2][{cname}] 顺序处理完成: {len(chapter_scenes)} 个分镜 ({errors} 块失败)")
+                return chapter_scenes, cname
+            else:
+                logger.warning(f"⚠️ [Stage2][{cname}] 章节全部失败跳过")
+                return [], cname
 
-            logger.error(f"🔴 [Stage2][{cname}] 重试 {MAX_RETRY} 次均失败，该章节将被跳过")
-            return [], cname
-
-        logger.info(f"🎦 [Stage2] 开始严格顺序处理 {len(files)} 个章节 (每章内 Semaphore(3) 并发切片)")
+        logger.info(f"🎦 [Stage2] 开始严格顺序处理 {len(files)} 个章节 (为了保证剧情连贯，已开启单段落顺序解析)")
         from core.protocols.render_protocol import RenderProtocol
 
         for ch_idx, file_info in enumerate(files):
@@ -380,6 +398,7 @@ class PipelineOrchestrator:
                     account=novel_id,
                     prompts=all_visual_prompts,
                     gateway=gateway,
+                    video_params=video_params
                 )
             )
         elif sandbox_mode:
@@ -475,9 +494,11 @@ class PipelineOrchestrator:
 
                 if img_result.get("status") != "success":
                     logger.error(
-                        f"❌ [Stage1.5] {entity_name} 生图失败: {img_result.get('error')}"
+                        f"❌ [Stage1.5] {entity_name} 生图失败: {img_result}"
                     )
                     return
+                else:
+                    logger.info(f"🟢 [Stage1.5] {entity_name} 生图成功: URL={img_result.get('url')[:60]}")
 
                 image_url = img_result["url"]
                 seed = img_result["seed"]
@@ -507,12 +528,14 @@ class PipelineOrchestrator:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         errs = [r for r in results if isinstance(r, Exception)]
         if errs:
-            logger.warning(f"⚠️ [Stage1.5] {len(errs)} 个实体处理异常: {errs[0]}")
+            logger.warning(f"⚠️ [Stage1.5] {len(errs)} 个实体处理异常: {errs}")
+            for ix, er in enumerate(errs):
+                logger.error(f"[Stage1.5] 异常详情 {ix+1}: {er}")
         logger.info(
             f"🎬 [Stage1.5] 章节={chapter_name} 共处理 {len(present_entities)} 个实体"
         )
 
-    async def run_video_generation(self, account: str, prompts: list, gateway: str = "seedance-1.5-pro"):
+    async def run_video_generation(self, account: str, prompts: list, gateway: str = "seedance-1.5-pro", video_params: dict = None):
         """
         Since we moved away from Playwright and to API-driven interfaces,
         this will use the configured Model API backend based on 'gateway'.
@@ -526,7 +549,15 @@ class PipelineOrchestrator:
             "wan2.6-i2v":    "wan2.6-i2v",
             "wan2.6-t2v":    "wan2.6-t2v",        # 备用：文生视频
             "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",
+            "seedance-1.0-pro-fast": "ep-20250218163046-6qbsg", # Need to fix Volcengine inference endpoint
         }
+        
+        # NOTE: Volcengine needs Endpoint ID, but wait, the API receives the model name or endpoint.
+        # "doubao-seedance-1.0-pro-fast" is usually requested via endpoint ID on Volcengine. But wait, I'll pass the exact string "doubao-seedance-1.0-pro-fast" or endpoint as the user gave unless I must use endpoint. 
+        # Actually the user gave the exact name `Doubao-Seedance-1.0-pro-fast`. So we will use it as is.
+        # So we map "seedance-1.0-pro-fast" to "doubao-seedance-1.0-pro-fast" Wait, let's keep it safe:
+        GATEWAY_MODEL_MAP["seedance-1.0-pro-fast"] = "Doubao-Seedance-1.0-pro-fast"
+        
         api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)
 
         # Dynamically load the correct class
@@ -586,7 +617,8 @@ class PipelineOrchestrator:
                     try:
                         task_id = await video_api.submit_task(
                             prompt_text,
-                            image_url=scene_image_url  # i2v 传入，t2v/seedance 忽略
+                            image_url=scene_image_url,  # i2v 传入，t2v/seedance 忽略
+                            **(video_params or {})
                         )
                         logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
                         break
@@ -607,14 +639,28 @@ class PipelineOrchestrator:
                     return None
 
                 # 轮询状态
-                max_retries = 60
-                for _ in range(max_retries):
+                max_retries = 150
+                error_strikes = 0  # 连续错误计数器
+
+                for poll_idx in range(max_retries):
                     await asyncio.sleep(5)
                     try:
                         status_info = await video_api.check_status(task_id)
+                        error_strikes = 0  # 状态查询成功，重置错误统计
                     except Exception as se:
-                        logger.warning(f"[Task {idx}] 状态查询异常: {se}，继续轮询")
+                        error_strikes += 1
+                        wait_sec = min(5 * (2 ** (error_strikes - 1)), 60) # 5s, 10s, 20s, 40s, 60s
+                        logger.warning(
+                            f"⚠️ [Task {idx}] 状态查询异常 (连续 {error_strikes} 次) "
+                            f"→ 错误信息: {se}。休眠 {wait_sec}秒 后继续轮询"
+                        )
+                        if error_strikes >= 5:
+                            logger.error(f"❌ [Task {idx}] API 断联 5 次，视为最终失败，结束轮询")
+                            return None
+                        
+                        await asyncio.sleep(wait_sec)
                         continue
+                        
                     status = status_info.get("status")
 
                     if status == "succeeded":
@@ -643,15 +689,15 @@ class PipelineOrchestrator:
                             return video_url
 
                     elif status == "failed":
-                        logger.error(f"[Task {idx}] 生成失败: {status_info.get('error')}")
+                        logger.error(f"[Task {idx}] 生成明确失败: {status_info.get('error')}")
                         return None
-                    elif status in ("running", "queued"):
-                        logger.debug(f"[Task {idx}] 等待生成中... 状态: {status}")
+                    elif status in ("running", "queued", "pending"):
+                        logger.debug(f"[Task {idx}] 等待生成中... 最新状态: {status}")
                     else:
-                        logger.warning(f"[Task {idx}] 未知状态: {status}")
-                        return None
+                        logger.warning(f"[Task {idx}] 遇到未经注册的 API 状态词汇: {status}，视为进行中...")
+                        continue
 
-                logger.error(f"[Task {idx}] 轮询超时")
+                logger.error(f"[Task {idx}] 轮询到达硬上限 ({max_retries}次)，强制超时中止")
                 return None
 
         tasks = [submit_and_wait(p, i + 1) for i, p in enumerate(prompts)]

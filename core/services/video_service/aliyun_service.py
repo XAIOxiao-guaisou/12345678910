@@ -86,20 +86,21 @@ class Wan2_6VideoAPI(BaseVideoGeneratorAPI):
                     f"[{self.model}] i2v 模式必须提供 image_url 参数"
                 )
             input_payload = {
-                "image_url": image_url,
+                "img_url": image_url,
                 "prompt": prompt,          # 可选但推荐：增强画面动态一致性
             }
         else:
             # t2v 模式：仅 prompt
             input_payload = {"prompt": prompt}
 
+        params = {}
+        if "duration" in kwargs: params["duration"] = kwargs["duration"]
+        if "resolution" in kwargs: params["resolution"] = kwargs["resolution"]
+        
         payload = {
             "model": self.model,
             "input": input_payload,
-            "parameters": {
-                # resolution 留空则自动按图像宽高比适配（i2v 推荐）
-                # 如需固定可以传入 "1280*720"
-            },
+            "parameters": params,
         }
 
         timeout = aiohttp.ClientTimeout(total=60)

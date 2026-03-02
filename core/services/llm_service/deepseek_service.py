@@ -198,7 +198,7 @@ class DeepSeekService:
 {sample}
 """
         logger.info("DeepSeek 提取记忆中枢世界观...")
-        for _ in range(3):
+        for attempt in range(4):
             try:
                 result_text = DeepSeekService.call_deepseek(prompt)
                 parsed = DeepSeekService.extract_json_from_deepseek(result_text)
@@ -206,7 +206,9 @@ class DeepSeekService:
                     return parsed
             except Exception as e:
                 logger.error(f"Error extracting memory context: {e}")
-            time.sleep(2)
+            wait_sec = min(5 * (2 ** attempt), 60)
+            logger.warning(f"⚠️ [建档] 第 {attempt+1} 次失败，退避 {wait_sec} 秒后重试...")
+            time.sleep(wait_sec)
             
         # 容错机制：如果建档失败，整个管线应当暂停并抛出警报
         raise RuntimeError("阶段一建档失败！DeepSeek 未能正确返回 JSON 格式的记忆中枢数据，管线中断。")
@@ -269,7 +271,7 @@ class DeepSeekService:
 ]
 """
         logger.info("DeepSeek 增量提取记忆差分...")
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 result_text = DeepSeekService.call_deepseek(prompt)
                 parsed = DeepSeekService.extract_json_from_deepseek(result_text)
@@ -284,31 +286,36 @@ class DeepSeekService:
                 logger.warning(f"[delta_extract] 第{attempt+1}次返回格式异常: {str(result_text)[:200]}")
             except Exception as e:
                 logger.error(f"[delta_extract] 第{attempt+1}次异常: {e}")
-            import time as _t; _t.sleep(2)
+            wait_sec = min(5 * (2 ** attempt), 60)
+            logger.warning(f"⚠️ [增量提取] 第 {attempt+1} 次失败，退避 {wait_sec} 秒...")
+            import time as _t; _t.sleep(wait_sec)
 
         logger.warning("⚠️ delta_extract_memory 全部失败，返回空列表（该章记忆不变）")
         return []
 
     @staticmethod
-    def generate_scenes_for_chunk(chunk_text, memory_context_str, previous_scene_summary: str = ""):
-        # === 长篇防 Token 爆炸：语义裁断 ===
-        clipped_prev_summary = ""
-        if previous_scene_summary:
-            text = previous_scene_summary.strip()
-            if len(text) > 300:
-                # 寻找最近的句号或换行跨位截断
-                cut_point = max(text.find("。", -300), text.find("\n", -300))
-                if cut_point != -1:
-                    clipped_prev_summary = text[cut_point:].strip()
-                else:
-                    clipped_prev_summary = text[-300:]
-            else:
-                clipped_prev_summary = text
+    def generate_scenes_for_chunk(chunk_text, memory_context_str, previous_context: dict = None):
+        # === 长篇短剧剧情连接优化：强行注入上一幕剧情与情绪流 ===
+        prompt_prev = ""
+        if previous_context and isinstance(previous_context, dict):
+            prev_summary = previous_context.get("summary", "")
+            prev_visual = previous_context.get("visual_prompt", "")
+            prev_emotion = previous_context.get("emotion", "")
+            prev_camera = previous_context.get("camera", "")
+            prev_hook = previous_context.get("hook", "")
 
-        prompt_prev = f"\n【前情提要（语义衔接参考）】：\n{clipped_prev_summary}\n" if clipped_prev_summary else ""
+            if prev_summary or prev_visual:
+                prompt_prev = f"""
+【前情接续强制约束（必须通过视听语言无缝承接）】：
+- 上幕结尾剧情: {prev_summary}
+- 上幕结尾画面: {prev_visual}
+- 上幕遗留情绪: {prev_emotion}
+- 上幕结尾运镜: {prev_camera}
+- 上幕制造的悬念(Hook): {prev_hook}
+"""
 
         prompt = f"""# Role
-你是一位极具审美直觉的 AI 电影总导演。你不需要听从任何死板的摄影指令，你拥有完全的视听语言决定权。
+你是一位深谙竖屏 AI 短剧（1-3分钟/集）流量密码的顶级总导演。你不需要听从任何死板的摄影指令，你拥有完全的视听语言决定权，擅长每 10-15 秒制造一次视觉或情绪波峰。
 
 【你的记忆空间】（由系统动态传入）：
 {memory_context_str}
@@ -318,30 +325,44 @@ class DeepSeekService:
 
 你的执导任务：
 
-感知情绪：阅读剧本，结合你的【记忆空间】，自主感受这一幕的戏剧张力、角色的心理状态和环境的潜台词。
+1. 短剧衔接与视听法则 (极高优先级)：
+如果你收到了【前情接续强制约束】，你的第一个分镜必须无缝点燃上幕遗留的悬念（Hook）！
+- 动作连读：如果上一幕角色动作未完成（如“伸手”），本幕第一个画面必须自然继承（如“紧紧抓住了门把手”）。
+- 情绪平滑渐变：承接上幕遗留情绪，如上幕是“极度恐慌”，本幕开头可以是“眼神微颤”，随后再发生情绪转折。切忌情绪出现突兀断层。
+- 转场技巧：巧妙利用关键道具特写、相似线条或相同景别切换，实现跨集/跨幕的无断点平滑过渡。
 
-场面调度：根据你对情绪的理解，自主决定每一段 15 秒视频的呈现方式。什么时候该用宏大的远景展现孤独？什么时候该用压抑的特写展现恐惧？由你全权安排。
+2. 10s短视频节奏论：
+- 每个分镜代表一段实际生成的视频流（通常为 5-15 秒）。
+- 拒绝无效垃圾铺垫：该分镜内必须交代一个核心动作推进、情绪爆发或线索揭示。强因果，快节奏。
 
-光影与质感：不要堆砌死板的相机参数。请用充满电影感和文学性的语言描述画面（如：“冰冷的晨光穿透百叶窗，空气中悬浮着不安的尘埃”）。阿里云万相模型极其擅长理解这种高维度的意境描述。
+3. 首尾闭环与钩子前置：
+- 你拆解出的一批分镜应具备内部逻辑闭环。
+- 尤其注意：在本次输出的【最后一个分镜】结尾，必须预埋一个强烈的“悬念 / 危机 / 身份反转”钩子（Hook），以此诱导观众继续往下看！
 
-实体追踪与视觉锚定：在每个分镜中，必须列出本场景明示或暗示涉及的所有实体 entity_id（必须从【你的记忆空间】挑选）。
-    - 【重要权重约束】：对于每一个出场（或未出场但其存在感影响画面）的实体，仔细阅读其在【你的记忆空间】中的“视觉延续性约束”及“逻辑快照”。
-    - 如果该实体有跨章视觉设定（如上一次活跃在某章的穿着、伤痕等），你必须在当前分镜的 visual_prompt 中以极高的权重延续并化用这些美学特征，保证镜头前后的叙事粘性与视觉连贯性。
+4. 光影与质感调度：
+- 不要死板堆砌相机参数。用充满电影感和文学性的词汇描绘光影、质感、构图（如“冰冷的晨光穿透百叶窗，空气中悬浮着不安的尘埃”）。目前主流视频生成大模型极其擅长理解此类高维意境描述。
+
+5. 实体追踪与视觉强锚定：
+- 每一幕都必须列出涉及的全部 entity_id（必须严格从【你的记忆空间】挑选）。
+- 若实体在本幕出场，必须在 visual_prompt 中以极高权重继承【你的记忆空间】里规定的“视觉氛围约束”，维持角色穿搭/外貌/特殊疤痕的每一丝细节连续。
 
 输出规范 (严格 JSON 数组)：
-请将你的导演构思转化为以下结构的 JSON，以便制片系统（飞书多维表格）分配拍摄任务：
+请将你的构思转化为以下结构，供自动制片引擎调用：
 [
   {{
     "scene_num": 1,
-    "summary": "简述剧情逻辑",
+    "summary": "简述本分镜(5-15s)的剧情动作流与起承转合",
     "entity_ids": ["e_xxxx_001", "e_xxxx_002"],
-    "director_notes": "导演手记：简述你为什么选择这样拍，你的视听意图是什么（此项供人类制片人参考）",
-    "visual_prompt": "你自主撰写的高维画面描述（无需死板的摄影机术语，注重画面内容、情绪光影、质感、主体动作的流畅描述。适合直接输入给中文视频大模型 Wan2.6）",
-    "audio_prompt": "你构思的背景音景与台词"
+    "director_notes": "导演手记：简述你为什么选择这样拍，视听意图在哪？",
+    "emotion": "本幕核心情绪轨迹（如：从震惊到内敛的愤怒）",
+    "camera": "转场与运镜提示（如：承接上幕面部特写，镜头跟随主角缓慢拉开）",
+    "hook": "本幕末尾抛出的钩子（前几个分镜可为空，但最后一个分镜必须设立强有力的危机/悬念 Hook！）",
+    "visual_prompt": "你自主撰写的高维画面描述，直接用于分发给视频大模型。(必须包含动作连续性表现、情绪光影、质感细节的极具张力的连续描述)",
+    "audio_prompt": "背景音景与画外音台词"
   }}
 ]
 """
-        for _ in range(3):
+        for attempt in range(4):
             try:
                 result_text = DeepSeekService.call_deepseek(prompt)
                 logger.info(f"DeepSeek Two-Stage Stage 2 Output (Length: {len(result_text)}):\n{result_text[:500]}...")
@@ -353,7 +374,9 @@ class DeepSeekService:
             except Exception as e:
                 logger.error(f"Error calling deepseek: {e}")
                 pass
-            time.sleep(2)
+            wait_sec = min(5 * (2 ** attempt), 60)
+            logger.warning(f"⚠️ [剧本拆解] 第 {attempt+1} 次失败，退避 {wait_sec} 秒...")
+            time.sleep(wait_sec)
         return []
 
     @staticmethod
@@ -401,8 +424,8 @@ class DeepSeekService:
                     f"Base visual DNA (keep these unchanged): {old_prompt}\n"
                     f"Visual evolution in this chapter: {evolution_lore}\n"
                     f"Entity: {entity.get('name','')}, Category: {entity.get('category','')}\n"
-                    f"Generate updated English image prompt (comma-separated tags, 80-150 words). "
-                    f"Output ONLY the English prompt, no explanation."
+                    f"Generate updated Chinese image prompt (comma-separated tags, 80-150 words). "
+                    f"Output ONLY the Chinese prompt, no explanation."
                 )
             else:
                 prompt_text = (
@@ -410,13 +433,13 @@ class DeepSeekService:
                     f"Entity: {entity.get('name','')}, Category: {entity.get('category','')}\n"
                     f"Lore: {entity.get('lore','')}\n"
                     f"Visual aura: {entity.get('visual_aura','')}\n"
-                    f"Generate an English image prompt (comma-separated tags, 80-150 words, "
-                    f"static visual elements only, end with masterpiece, best quality, highly detailed, 8k). "
-                    f"Output ONLY the English prompt, no explanation."
+                    f"Generate a Chinese image prompt (comma-separated tags, 80-150 words, "
+                    f"static visual elements only, end with 杰作, 最高画质, 极具细节, 8k). "
+                    f"Output ONLY the Chinese prompt, no explanation."
                 )
 
         logger.info(f"🎨 [VisualPrompt] 生成 {'迭代' if is_evolution else '初始'} Prompt: {entity.get('name','')}")
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 result = DeepSeekService.call_deepseek(prompt_text)
                 # 清理：去除 markdown 代码块包装，提取纯文本
@@ -433,12 +456,14 @@ class DeepSeekService:
                 logger.warning(f"[VisualPrompt] 第{attempt+1}次返回过短: {result[:50]}")
             except Exception as e:
                 logger.error(f"[VisualPrompt] 第{attempt+1}次异常: {e}")
-            time.sleep(2)
+            wait_sec = min(5 * (2 ** attempt), 60)
+            logger.warning(f"⚠️ [视觉Prompt] 第 {attempt+1} 次失败，退避 {wait_sec} 秒...")
+            time.sleep(wait_sec)
 
         # 降级：返回基于 visual_aura 的简单 Prompt
         fallback = (
             f"{entity.get('visual_aura', '')} {entity.get('lore', '')[:50]}, "
-            f"masterpiece, best quality, highly detailed, 8k"
+            f"杰作, 最高画质, 极具细节, 8k"
         ).strip(", ")
         logger.warning(f"[VisualPrompt] 全部失败，使用降级 Prompt: {fallback[:60]}")
         return fallback
