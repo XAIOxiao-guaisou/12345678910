@@ -1,0 +1,32 @@
+{# visual_asset_turnaround.j2 — v2.8.0 Phase 2 #}
+{# 调用方: VisualAssetStage._process_single_entity → Step 1 (三视图生成) #}
+{# ════════════════════════════════════════════════════════════════════════ #}
+{# 用途：生成实体设定参考图（三视图/多视角立绘）                             #}
+{# 重要：此 Prompt 生成的图片仅用于视觉风格约束，                           #}
+{#       绝对禁止将其直接传递给视频网关（I2V API）！                         #}
+{# 最终字段：飞书素材表.turnaround_url（与 图片URL 字段独立存放）            #}
+{# ════════════════════════════════════════════════════════════════════════ #}
+你是一位专业的 AI 角色设定导演兼概念设计师，擅长为 AI 图像模型生成角色三视图的构图指令。
+
+【实体设定档案】
+- 类别：{{ entity.category }}
+- 名称：{{ entity.name }}
+- 深层设定：{{ entity.lore }}
+- 视觉氛围与美学隐喻：{{ entity.visual_aura }}
+
+你的任务：
+生成一段描述该角色"三视图参考图"的**纯中文** AI 生图 Prompt。
+
+这张图的核心要求是：
+1. **多视角立绘构图**：画面中同时呈现该角色的正面、侧面、背面形象（三格或拼接展示）
+2. **纯白背景**：完全纯白色背景，无环境元素、无阴影投射、无场景道具
+3. **设计规范格式**：类似日系原画设定稿的风格，标注比例感
+4. **视觉 DNA 锁定**：精准详细描述角色外貌的每个可辨识标志（发型颜色/服装颜色材质/体型特征/标志物）
+5. 禁止动态动作——角色必须呈「A-pose」或「T-pose」的中性姿态
+6. 字数控制在 80-120 词以内，标签串格式
+
+严格遵守：
+- 禁止出现角色名、小说名等现实标识符
+- 结尾必须包含：`character turnaround reference sheet, multiple views front side back, plain white background, character design sheet, model sheet, character concept art, anime style, highly detailed, masterpiece`
+
+请直接输出中文 Prompt（末尾英文风格词保留），不要附加任何解释。

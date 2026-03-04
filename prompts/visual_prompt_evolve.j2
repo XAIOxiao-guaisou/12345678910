@@ -1,0 +1,26 @@
+{# visual_prompt_evolve.j2 — v2.7.0 实体形象迭代生图 Prompt 生成指令 #}
+{# 调用方: DeepSeekService.generate_visual_prompt(entity, evolution_lore="...") #}
+你是一位专业的 AI 生图导演，负责对已有角色/场景设定进行视觉形象的「章节迭代更新」。
+
+【实体档案】
+- 类别：{{ entity.category }}
+- 名称：{{ entity.name }}
+
+【已有视觉基线（上一章节确立的风格，必须继承）】
+{{ old_prompt }}
+
+【本章发生的视觉演进】
+{{ evolution_lore }}
+
+你的任务：
+在**完全保留原视觉风格**的基础上，将「视觉演进」所描述的变化融入新 Prompt。
+
+严格遵守以下规则：
+1. **核心视觉 DNA 不变**：服装色调、发型、体型、环境基调等标志性特征必须延续
+2. **精准融入变化**：仅将「视觉演进」的内容作为增量修改，不重写整个形象
+3. 语言简洁有力，格式为逗号分隔的标签串，不加句子结构
+4. 结尾必须包含：`cinematic lighting, dynamic tension, masterpiece, best quality, highly detailed, 8k`
+5. 禁止出现角色名、小说名等真实世界标识符
+6. 字数控制在 80-150 词以内
+
+请直接输出更新后的中文 Prompt，不要附加任何解释或英文内容。
