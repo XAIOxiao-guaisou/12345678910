@@ -178,13 +178,13 @@ async def mux(
         cmd += ["-c", "copy", output_path]
     elif audio_count == 1:
         # 单音轨：调整音量后直接合并
-        vol_map = {tts: "4", sfx: "0.5", bgm: "0.25"}
+        vol_map = {tts: "1.0", sfx: "0.316", bgm: "0.251"}
         vol = vol_map.get(audio_inputs[0], "1.0")
         cmd += [
             "-filter_complex", f"[1:a]volume={vol}[aout]",
             "-map", "0:v",
             "-map", "[aout]",
-            "-c:v", "libx264", "-c:a", "aac",
+            "-c:v", "h264_nvenc", "-preset", "p6", "-c:a", "aac",
         ]
         if sync_strategy in ("trim_audio", "loop_video"):
             cmd += ["-shortest"]
@@ -196,7 +196,7 @@ async def mux(
             "-filter_complex", fc,
             "-map", "0:v",
             "-map", "[aout]",
-            "-c:v", "libx264", "-c:a", "aac",
+            "-c:v", "h264_nvenc", "-preset", "p6", "-c:a", "aac",
         ]
         if sync_strategy in ("trim_audio", "loop_video"):
             cmd += ["-shortest"]
@@ -235,8 +235,8 @@ def _build_amix_filter(
     轨道序号从 1 开始（0 是视频轨）。
 
     音量级别（参照混音工程惯例）：
-      TTS 人声：-4dB  → volume=0.794
-      SFX 音效：-6dB  → volume=0.501
+      TTS 人声：0dB  → volume=1.0
+      SFX 音效：-10dB  → volume=0.316
       BGM 背景：-12dB → volume=0.251
     """
     parts = []
@@ -244,11 +244,11 @@ def _build_amix_filter(
     idx = 1
 
     if tts:
-        parts.append(f"[{idx}:a]volume=0.794[tts_v]")
+        parts.append(f"[{idx}:a]volume=1.000[tts_v]")
         labels.append("[tts_v]")
         idx += 1
     if sfx:
-        parts.append(f"[{idx}:a]volume=0.501[sfx_v]")
+        parts.append(f"[{idx}:a]volume=0.316[sfx_v]")
         labels.append("[sfx_v]")
         idx += 1
     if bgm:
