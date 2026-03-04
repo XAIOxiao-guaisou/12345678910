@@ -232,12 +232,19 @@ class PipelineOrchestrator:
                     await asyncio.sleep((idx - 1) * 2)
 
                     scene_image_url = ""
+                    multi_frame_kwargs = {}
                     if is_i2v:
                         try:
                             if isinstance(prompt_text, tuple):
-                                prompt_text, scene_image_url = prompt_text
-                            if not scene_image_url:
-                                logger.warning(f"[Task {idx}] i2v 模式无 image_url，降级为文生视频")
+                                prompt_text, imgs = prompt_text
+                                if isinstance(imgs, list):
+                                    from core.protocols.render_protocol import RenderProtocol
+                                    multi_frame_kwargs = RenderProtocol.resolve_multi_frame(imgs, active_gateway)
+                                    scene_image_url = multi_frame_kwargs.pop("image_url", "")
+                                else:
+                                    scene_image_url = imgs
+                            if not scene_image_url and not multi_frame_kwargs:
+                                logger.warning(f"[Task {idx}] i2v 模式无有效 image_url，降级为文生视频")
                         except Exception:
                             pass
                             
@@ -249,7 +256,7 @@ class PipelineOrchestrator:
                             task_id_video = await active_video_api.submit_task(
                                 prompt_text,
                                 image_url=scene_image_url,
-                                **(video_params or {})
+                                **{**(video_params or {}), **multi_frame_kwargs}
                             )
                             logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id_video}")
                             break
@@ -629,34 +636,55 @@ class PipelineOrchestrator:
                         a = await asyncio.to_thread(
                             self.bitable.get_asset_by_entity, eid, novel_id
                         )
-                        url = a.get("image_url", "") if a.get("found") else ""
-                        return eid, url
+                        return eid, a if a.get("found") else None
 
                     fetch_results = await asyncio.gather(
                         *[_fetch_one(eid) for eid in chapter_entity_ids],
                         return_exceptions=True,
                     )
                     asset_cache = {
-                        eid: url
-                        for eid, url in fetch_results
-                        if not isinstance((eid, url), Exception) and isinstance(url, str) and url
+                        eid: a
+                        for eid, a in fetch_results
+                        if not isinstance((eid, a), Exception) and a
                     }
                     logger.info(
                         f"[Stage3-Bind] {chapter_name_s2}: "
-                        f"{len(asset_cache)}/{len(chapter_entity_ids)} 个实体匹配到图片"
+                        f"{len(asset_cache)}/{len(chapter_entity_ids)} 个实体匹配到资产"
                     )
 
-                # 打包 (prompt, image_url) 元组；无图降级为纯 prompt（t2v fallback）
+                # v3.0.0-PRO: Stage 2.5 (I2I Derivation)
+                from core.services.image_service.derivation_engine import DerivationEngine
+                derivation_engine = DerivationEngine(backend=image_gateway)
+                
+                # 打包 (prompt, image_urls) 元组；无图降级为纯 prompt
                 for sc in chapter_scenes:
                     vp = sc.get("visual_prompt", "")
                     if not (vp and isinstance(vp, str) and len(vp) > 10):
                         continue
-                    image_url = ""
+                    
+                    img_urls = []
                     for eid in (sc.get("entity_ids") or []):
                         if str(eid) in asset_cache:
-                            image_url = asset_cache[str(eid)]
-                            break
-                    all_visual_prompts.append((vp, image_url) if image_url else vp)
+                            base_asset = asset_cache[str(eid)]
+                            # Trigger I2I Frame Derivation
+                            logger.info(f"🧬 [Stage2.5] 为分镜衍生实体 {eid} 的视觉帧...")
+                            try:
+                                derived_result = await derivation_engine.derive_scene_frame(
+                                    entity_id=str(eid),
+                                    base_image_url=base_asset.get("image_url", ""),
+                                    visual_anchor_prompt=base_asset.get("visual_prompt", ""),
+                                    dynamic_description=sc.get("summary", ""),
+                                    base_seed=base_asset.get("seed", 0)
+                                )
+                                if derived_result.get("status") == "success" and derived_result.get("url"):
+                                    img_urls.append(derived_result["url"])
+                            except Exception as e:
+                                logger.error(f"衍生失败: {e}")
+                                # 彻底失败则选用原始 base
+                                if base_asset.get("image_url"):
+                                    img_urls.append(base_asset["image_url"])
+                    
+                    all_visual_prompts.append((vp, img_urls) if img_urls else vp)
 
             logger.info(f"📌 [Stage2] {chapter_name_s2} 写入 {len(ids)} 条，集数 {start_ep}~{episode_counter[0]-1}")
             if on_progress:

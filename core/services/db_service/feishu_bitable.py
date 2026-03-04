@@ -1305,3 +1305,46 @@ class FeishuBitableManager:
         except Exception as e:
             logger.error(f"_search_field_in_factory [{field_name}]: {e}")
             return ""
+
+    def lock_storyboard(self, record_id: str) -> bool:
+        """v3.0.0-PRO: Video generated, lock the storyboard to prevent overwrites."""
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/{record_id}"
+        payload = {"fields": {"Row_Lock": True, "Storage_Zone": "冻结"}}
+        try:
+            resp = requests.put(url, headers=self._get_headers(), json=payload)
+            resp.raise_for_status()
+            logger.info(f"🔒 [防覆盖] 分镜记录 {record_id} 已隔离至冻结区。")
+            return True
+        except Exception as e:
+            logger.error(f"lock_storyboard 异常: {e}")
+            return False
+
+    def update_storyboard_with_lock_check(self, record_id: str, new_fields: dict) -> str:
+        """v3.0.0-PRO: 审计更新分镜，若已锁定则产生衍生副本(Draft)。"""
+        url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records/{record_id}"
+        try:
+            resp = requests.get(url, headers=self._get_headers())
+            resp.raise_for_status()
+            fields = resp.json().get("data", {}).get("record", {}).get("fields", {})
+            is_locked = fields.get("Row_Lock", False)
+            
+            if is_locked:
+                logger.info(f"🛡️ 记录 {record_id} 处于锁定保护中，触发深度衍生副本生成。")
+                duplicate_fields = {**fields, **new_fields}
+                duplicate_fields.pop("Row_Lock", None)
+                duplicate_fields["Storage_Zone"] = "草稿"
+                
+                create_url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}/tables/{TABLE_SCRIPT}/records"
+                c_resp = requests.post(create_url, headers=self._get_headers(), json={"fields": duplicate_fields})
+                c_resp.raise_for_status()
+                new_rid = c_resp.json().get("data", {}).get("record", {}).get("record_id")
+                logger.info(f"📝 衍生分镜副本创建成功: {new_rid}")
+                return new_rid
+            else:
+                u_resp = requests.put(url, headers=self._get_headers(), json={"fields": new_fields})
+                u_resp.raise_for_status()
+                logger.info(f"✏️ 原位更新分镜 {record_id}")
+                return record_id
+        except Exception as e:
+            logger.error(f"update_storyboard_with_lock_check 异常: {e}")
+            return ""
