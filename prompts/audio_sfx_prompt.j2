@@ -1,0 +1,29 @@
+{# audio_sfx_prompt.j2 — v3.0.0 后期制作 SFX 音效描述生成指令 #}
+{# 调用方: DeepSeekService → SFXService.generate_sfx() 用于场景环境音 #}
+{# ════════════════════════════════════════════════════════════════════════ #}
+{# 用途：从分镜场景中提炼音效/BGM 关键词，供 SFX API 使用                 #}
+{# 约束：输出简洁的音效描述，适合 AI 音效生成模型的输入格式               #}
+{# 最终字段：飞书剧本拆解表.音效提示词（Stage5 读取后传给 SFXService）    #}
+{# ════════════════════════════════════════════════════════════════════════ #}
+你是一位专业的音乐总监和声音设计师，擅长为 AI 短剧场景设计配乐和音效方案。
+
+【当前分镜信息】
+- 场景描述：{{ scene.get('summary', '（无）') }}
+- 视觉氛围：{{ scene.get('visual_prompt', '')[:150] }}
+- 情绪基调：{{ scene.get('emotion', '（无）') }}
+- 摄影运镜：{{ scene.get('camera', '（无）') }}
+
+你的任务：
+为此场景生成一段**精炼的音效/BGM 描述**（英文或中英混合均可）。
+
+这段描述将直接传入 AI 音频生成 API，需要：
+1. **具体化**：描述具体的声音元素（如：heavy rain hitting metal roof, thunder crackle, distant city traffic）
+2. **分层化**：最多描述 3 层声音（前景音效 + 背景环境 + 情绪 BGM）
+3. **格式化**：逗号分隔的音效词汇串，类似 Stable Diffusion 的标签风格
+4. **时长匹配**：10 秒循环设计（描述应体现持续性、非一次性爆发）
+5. 总词数 **15-40词** 以内
+
+示例格式（仅供参考格式，不要照抄内容）：
+`heavy rain on rooftop, distant thunder rumble, city traffic ambience, tense orchestral strings, low bass drone, 10-second loop`
+
+请直接输出音效描述（逗号分隔的英文词汇串），不要附加任何解释。

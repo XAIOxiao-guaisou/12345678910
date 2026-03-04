@@ -1,3 +1,4 @@
+from core.config import settings
 """
 pollinations_service.py — v2.7.0 图像生成服务
 
@@ -52,9 +53,9 @@ class PollinationsService:
         #   pollinations.ai       — 用户原始方案命名
         #   POLLINATIONS_KEY      — 简写兼容
         self.api_key: str = (
-            os.getenv("POLLINATIONS_API_KEY", "")
-            or os.getenv("pollinations.ai", "")
-            or os.getenv("POLLINATIONS_KEY", "")
+            settings.POLLINATIONS_API_KEY
+            or ""
+            or settings.POLLINATIONS_KEY
         )
         if self.api_key:
             logger.info("✅ [Pollinations] API Key 已加载（授权模式）")

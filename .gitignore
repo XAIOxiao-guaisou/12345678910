@@ -6,6 +6,7 @@ __pycache__/
 output/
 outputs/
 logs/
+data/
 *.png
 *.html
 temp_feishu.py

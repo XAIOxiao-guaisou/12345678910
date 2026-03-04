@@ -1,3 +1,4 @@
+from core.config import settings
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
@@ -14,38 +15,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 pipeline = PipelineOrchestrator()
 
-# 批量任务进度存储（task_id → 进度信息 Dict）
-_batch_tasks: dict = {}
-
-def get_batch_tasks_file():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "logs", "batch_tasks.json")
-
-def load_batch_tasks():
-    global _batch_tasks
-    filepath = get_batch_tasks_file()
-    if os.path.exists(filepath):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                _batch_tasks = json.load(f)
-            logger.info(f"✅ 从快照成功恢复了 {len(_batch_tasks)} 个批量任务记录")
-        except Exception as e:
-            logger.error(f"⚠️ 读取 batch_tasks.json 失败 (可能文件损坏)，内存状态归零: {e}")
-            _batch_tasks = {}
-
-def save_batch_tasks():
-    # 写入节流在调用侧做，这里提供原子化落盘
-    filepath = get_batch_tasks_file()
-    tmp_path = filepath + ".tmp"
-    try:
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(_batch_tasks, f, ensure_ascii=False)
-        os.replace(tmp_path, filepath)
-    except Exception as e:
-        logger.error(f"保存 batch_tasks.json 失败: {e}")
-
-# 在模块加载时尝试恢复
-load_batch_tasks()
+from core.api.state import StateKeeper
+state_keeper = StateKeeper()
 
 @router.post("/api/run")
 async def run_task(task: TaskRequest, background_tasks: BackgroundTasks):
@@ -65,7 +36,7 @@ from pydantic import ValidationError
 @router.get("/api/system_info")
 async def system_info():
     return {
-        "mock_mode": os.environ.get("MOCK_MODE", "False") == "True",
+        "mock_mode": settings.MOCK_MODE == "True",
         "smart_presets": SMART_PRESETS,
         "capabilities": GATEWAY_SPECS
     }
@@ -73,7 +44,7 @@ async def system_info():
 # Keeping /api/mock_status for backward compatibility
 @router.get("/api/mock_status")
 async def mock_status():
-    return {"mock_mode": os.environ.get("MOCK_MODE", "False") == "True"}
+    return {"mock_mode": settings.MOCK_MODE == "True"}
 
 from core.models.schemas import UpdatePresetRequest
 
@@ -310,14 +281,29 @@ async def upload_novel_batch(
     memory_lock: bool = Form(False),
     style: str = Form("anime"),
     gateway: str = Form("wan_2_6"),
+    image_gateway: str = Form("aliyun"),
     sandbox_mode: bool = Form(True),
     chunk_size: int = Form(1000),
+    # --- UI Config Panel Params ---
+    aliyun_image_model: str = Form("wan2.6-t2i"),
+    aliyun_video_model: str = Form("wan2.6-i2v-flash"),
+    prompt_extend: bool = Form(True),
+    auto_audio: bool = Form(True),
+    tts_voice: str = Form("Cherry"),
+    aspect_ratio: str = Form("16:9"),
+    segmented_processing: str = Form("auto"),
 ):
     """
     批量多文件上传入口（multipart/form-data）。
     接受浏览器 FormData 提交的文件列表，自动转换为 FileItem 格式。
     返回 task_id 供前端订阅 SSE 流。
     """
+    # 强制动态网关绑定，防止前端引用的旧版 JS 缓存发送错误的 gateway (如默认的 seedance)
+    if "wan" in aliyun_video_model.lower():
+        gateway = "wan_2_6"
+    elif "seedance" in aliyun_video_model.lower() or "volc" in aliyun_video_model.lower():
+        gateway = "seedance-1.0-pro-fast"
+
     # 验证 novel_id（防路径穿越）
     import re
     if not re.match(r'^[\w\u4e00-\u9fa5\-]{1,32}$', novel_id):
@@ -338,7 +324,7 @@ async def upload_novel_batch(
         raise HTTPException(status_code=422, detail="未收到任何文件")
 
     task_id = str(uuid.uuid4())
-    _batch_tasks[task_id] = {
+    initial_task = {
         "status": "queued",
         "novel_id": novel_id,
         "total_files": len(file_items),
@@ -349,34 +335,38 @@ async def upload_novel_batch(
         "log": [],
         "finished": False,
     }
+    await state_keeper.create_task(task_id, initial_task)
 
     async def _run_batch():
         await asyncio.sleep(1)  # Allow HTTP response to flush before blocking event loop
-        task = _batch_tasks[task_id]
-        task["status"] = "running"
+        await state_keeper.update_task(task_id, {"status": "running"})
 
         _last_save_time = 0
         async def on_progress(stage, current, total, chapter_name, status):
             nonlocal _last_save_time
+            now = time.time()
+            force = status in ("error", "success") or (now - _last_save_time > 3)
+            
+            updates = {}
             if stage == "stage1":
-                task["stage1_done"] = current
+                updates["stage1_done"] = current
                 if status not in ("success",):
-                    task["failed_chapters"].append(chapter_name)
-            task["log"].append({
+                    t = await state_keeper.get_task(task_id)
+                    fc = t.get("failed_chapters", [])
+                    fc.append(chapter_name)
+                    updates["failed_chapters"] = fc
+            if updates:
+                await state_keeper.update_task(task_id, updates, force_save=False)
+                
+            log_entry = {
                 "stage": stage,
                 "chapter": chapter_name,
                 "progress": f"{current}/{total}",
                 "status": status,
-                "ts": time.time()
-            })
-            # 限据 log 长度防内存溢出
-            if len(task["log"]) > 200:
-                task["log"] = task["log"][-200:]
-            
-            # 节流保存：至少间隔 3 秒，或是关键状态（报错）
-            now = time.time()
-            if status in ("error", "success") or (now - _last_save_time > 3):
-                save_batch_tasks()
+                "ts": now
+            }
+            await state_keeper.append_log(task_id, log_entry, force_save=force)
+            if force:
                 _last_save_time = now
 
         try:
@@ -385,22 +375,28 @@ async def upload_novel_batch(
                 novel_id=novel_id,
                 style_key=style,
                 gateway=gateway,
-                video_params={},
+                image_gateway=image_gateway,
+                video_params={
+                    "aliyun_image_model": aliyun_image_model,
+                    "aliyun_video_model": aliyun_video_model,
+                    "prompt_extend": prompt_extend,
+                    "auto_audio": auto_audio,
+                    "tts_voice": tts_voice,
+                    "aspect_ratio": aspect_ratio,
+                    "segmented_processing": segmented_processing,
+                },
                 sandbox_mode=sandbox_mode,
                 chunk_size=chunk_size,
                 on_progress=on_progress,
                 task_id=task_id,
                 memory_lock=memory_lock,
             )
-            task["status"] = result.get("status", "done")
-            task["scenes"] = result.get("scenes", 0)
+            await state_keeper.update_task(task_id, {"status": result.get("status", "done"), "scenes": result.get("scenes", 0)})
         except Exception as e:
             logger.error(f"[批量任务] {task_id} 异常: {e}")
-            task["status"] = "error"
-            task["error"] = str(e)
+            await state_keeper.update_task(task_id, {"status": "error", "error": str(e)})
         finally:
-            task["finished"] = True
-            save_batch_tasks()
+            await state_keeper.update_task(task_id, {"finished": True}, force_save=True)
 
     asyncio.create_task(_run_batch())
     logger.info(f"📚 [批量接口] 任务 {task_id} 已入队: novel_id={novel_id}, 文件数={len(file_items)}")
@@ -416,7 +412,7 @@ async def upload_novel_batch(
 @router.get("/api/batch_status/{task_id}")
 async def get_batch_status(task_id: str):
     """返回批量任务当前的进度快照（键入式轮询）"""
-    task = _batch_tasks.get(task_id)
+    task = await state_keeper.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail=f"task_id={task_id} 不存在或已过期")
     return {
@@ -439,7 +435,7 @@ async def progress_stream(task_id: str):
     """
     from fastapi.responses import StreamingResponse
     import asyncio
-    task = _batch_tasks.get(task_id)
+    task = await state_keeper.get_task(task_id)
 
     # === [增强设计] 内存丢失时的飞书回捞机制 ===
     if not task:
@@ -476,7 +472,8 @@ async def progress_stream(task_id: str):
 
         while True:
             now = time.time()
-            logs = task.get("log", [])
+            current_task = await state_keeper.get_task(task_id) or task
+            logs = current_task.get("log", [])
 
             # 推送新日志条目
             new_logs = logs[last_log_idx:]
@@ -492,12 +489,12 @@ async def progress_stream(task_id: str):
                 last_heartbeat = now
 
             # 任务完成，发送最终状态并关闭流
-            if task.get("finished"):
+            if current_task.get("finished"):
                 final = {
                     "event": "done",
-                    "status": task["status"],
-                    "scenes": task["scenes"],
-                    "failed_chapters": task["failed_chapters"],
+                    "status": current_task.get("status"),
+                    "scenes": current_task.get("scenes", 0),
+                    "failed_chapters": current_task.get("failed_chapters", []),
                 }
                 yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
                 break
@@ -516,7 +513,7 @@ async def progress_stream(task_id: str):
 @router.get("/api/tasks/active")
 async def get_active_task():
     """返回当前最近一个未完成的 Batch Task，便于页面刷新后自动重连进度条。"""
-    active_tasks = {k: v for k, v in _batch_tasks.items() if not v.get("finished", False)}
+    active_tasks = await state_keeper.get_all_active_tasks()
     if not active_tasks:
         return {"status": "none"}
     
@@ -536,28 +533,67 @@ async def stop_task(task_id: str):
     将指定任务标记为已停止（finished=True, status=stopped）。
     后台 asyncio 任务在下一个章节检查点时会读取此标记并提前退出。
     """
-    if task_id not in _batch_tasks:
+    task = await state_keeper.get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
-    _batch_tasks[task_id]["finished"] = True
-    _batch_tasks[task_id]["status"] = "stopped"
-    _batch_tasks[task_id]["cancelled"] = True
-    save_batch_tasks()
+    await state_keeper.stop_task(task_id)
     logger.info(f"🛑 任务 {task_id} 已被手动停止")
     return {"status": "stopped", "task_id": task_id}
 
 @router.post("/api/tasks/stop_all")
 async def stop_all_tasks():
     """停止所有当前活跃任务（批量停止）。"""
-    stopped = []
-    for task_id, task in _batch_tasks.items():
-        if not task.get("finished", False):
-            task["finished"] = True
-            task["status"] = "stopped"
-            task["cancelled"] = True
-            stopped.append(task_id)
-    save_batch_tasks()
+    stopped = await state_keeper.stop_all_tasks()
     logger.info(f"🛑 已停止 {len(stopped)} 个活跃任务: {stopped}")
     return {"status": "ok", "stopped": stopped}
+
+from pydantic import BaseModel
+from typing import Optional
+class UpdateTaskConfigRequest(BaseModel):
+    gateway: Optional[str] = None
+    image_gateway: Optional[str] = None
+    aliyun_video_model: Optional[str] = None
+
+@router.post("/api/tasks/update_config/{task_id}")
+async def update_task_config(task_id: str, req: UpdateTaskConfigRequest):
+    """
+    实时更新正在运行的任务的配置（如切换视频生成或图片生成网关、以及更换具体模型名）。
+    """
+    task = await state_keeper.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("finished"):
+        return {"status": "error", "message": "该任务所在的后台进程已经终止或死亡，无法再接受配置更新！请重新提交文本。"}
+        
+    updates = {}
+    if req.gateway is not None:
+        updates["gateway"] = req.gateway
+    if req.image_gateway is not None:
+        updates["image_gateway"] = req.image_gateway
+    if req.aliyun_video_model is not None:
+        updates["aliyun_video_model"] = req.aliyun_video_model
+        
+    if updates:
+        # 为了让 pipeline 也能读到单独针对 video_params 的注入，这块其实直接更新到外层就行
+        # 稍后 pipeline.py 会自动读取外层的 aliyun_video_model
+        await state_keeper.update_task(task_id, updates, force_save=True)
+        logger.info(f"🔄 任务 {task_id} 配置已更新: {updates}")
+    return {"status": "ok", "message": "Config updated"}
+
+@router.post("/api/tasks/retry/{task_id}")
+async def retry_task(task_id: str):
+    """
+    接收前端一键重试的信号，给任务打上 retry_signal 使得挂起的任务强行跳回尝试循环
+    """
+    task = await state_keeper.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if task.get("finished"):
+        return {"status": "error", "message": "关联的底层 Python 进程已由于服务器关机意外死亡！一键重试无法对空气生效。请携带相同的 [项目 ID] 重新提交原文件，系统会自动断点续传。"}
+        
+    await state_keeper.update_task(task_id, {"retry_signal": True}, force_save=True)
+    logger.info(f"⚡ 任务 {task_id} 收到前端显式重试信号 (retry_signal=True)")
+    return {"status": "ok", "message": "Retry signal submitted"}
 
 @router.get("/api/system/health")
 async def get_system_health():

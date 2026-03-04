@@ -1,3 +1,4 @@
+from core.config import settings
 import time
 import requests
 import logging
@@ -12,24 +13,24 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # Feishu API Constants
 # ---------------------------------------------------------
-APP_ID = os.environ.get("FEISHU_APP_ID", "cli_a914c526d5f8dbc6")
-APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
+APP_ID = settings.FEISHU_APP_ID
+APP_SECRET = settings.FEISHU_APP_SECRET
 
 # The Assets (角色风格库)
-APP_TOKEN_ASSETS = os.environ.get("FEISHU_APP_TOKEN_ASSETS", "Oj00bIhGVaq1cNsZsJhcMC58ndd")
-TABLE_ASSETS = os.environ.get("FEISHU_TABLE_ASSETS", "tblC6L0fO7FXP3fI")
+APP_TOKEN_ASSETS = settings.FEISHU_APP_TOKEN_ASSETS
+TABLE_ASSETS = settings.FEISHU_TABLE_ASSETS
 
 # The Factory (素材生成表)
-APP_TOKEN_FACTORY = os.environ.get("FEISHU_APP_TOKEN_FACTORY", "Cu75bLeuJarqg1s7ysscaNolnPg")
-TABLE_FACTORY = os.environ.get("FEISHU_TABLE_FACTORY", "tbloUrdwqG47ZmgI")
+APP_TOKEN_FACTORY = settings.FEISHU_APP_TOKEN_FACTORY
+TABLE_FACTORY = settings.FEISHU_TABLE_FACTORY
 
 # The Brain (剧本拆解表)
-APP_TOKEN_SCRIPT = os.environ.get("FEISHU_APP_TOKEN_SCRIPT", "J7OPbwEHqaJMefs1NLecTvA1n2e")
-TABLE_SCRIPT = os.environ.get("FEISHU_TABLE_SCRIPT", "tbluFmGLkmqPTd9S")
+APP_TOKEN_SCRIPT = settings.FEISHU_APP_TOKEN_SCRIPT
+TABLE_SCRIPT = settings.FEISHU_TABLE_SCRIPT
 
 # The Memory Hub (记忆中枢表)
-APP_TOKEN_MEMORY = os.environ.get("FEISHU_APP_TOKEN_MEMORY", "XfWibZ0RjaPD1psTFwscKP1VnUb")
-TABLE_MEMORY = os.environ.get("FEISHU_TABLE_MEMORY", "tblcFydnJuwD8cIy")
+APP_TOKEN_MEMORY = settings.FEISHU_APP_TOKEN_MEMORY
+TABLE_MEMORY = settings.FEISHU_TABLE_MEMORY
 
 # -------------------------------------------------------
 # Required fields per table (for startup validation)
@@ -142,9 +143,9 @@ class FeishuBitableManager:
         fields = record.get("fields", {})
         
         check_keys = ("视觉提示词", "小说原文（内容）")
-        if table_id == os.environ.get("FEISHU_TABLE_FACTORY", "tbloUrdwqG47ZmgI"):
+        if table_id == settings.FEISHU_TABLE_FACTORY:
             check_keys = ("视觉描述（英文Prompt）", "图片URL")
-        elif table_id == os.environ.get("FEISHU_TABLE_MEMORY", "tblcFydnJuwD8cIy"):
+        elif table_id == settings.FEISHU_TABLE_MEMORY:
             check_keys = ("词条名", "所属小说ID")
 
         for key in check_keys:

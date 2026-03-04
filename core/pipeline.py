@@ -1,8 +1,11 @@
+from typing import List, Union
+from core.config import settings
 import asyncio
 import logging
 import time
 import os
 import aiohttp
+from core.task_manager import TaskManager
 from collections import defaultdict
 from core.services.llm_service.deepseek_service import DeepSeekService
 from core.services.db_service.feishu_bitable import FeishuBitableManager
@@ -15,8 +18,7 @@ logger = logging.getLogger(__name__)
 class PipelineOrchestrator:
     def __init__(self):
         self.bitable = FeishuBitableManager()
-        # novel_id 粒度并发锁：同 小说 内 Stage1 串行，不同小说间真并行
-        self.novel_locks: defaultdict = defaultdict(asyncio.Lock)
+        self.task_manager = TaskManager()
         # Aria2c 健康检查（异步，启动时非阻塞触发）
         asyncio.get_event_loop().create_task(Aria2cService.init()) if self._loop_running() else None
 
@@ -38,8 +40,10 @@ class PipelineOrchestrator:
         chunk_size: int = 1000,
         video_params: dict = None,
         gateway: str = "wan_2_6",
+        image_gateway: str = "aliyun", # Added explicit image_gateway param
         sandbox_mode: bool = True,
         novel_id: str = "",
+        task_id: str = "",
     ):
         """
         v2.6.0: 去除了清空操作，支持 novel_id 隔离。
@@ -162,6 +166,251 @@ class PipelineOrchestrator:
             "prompts": prompts
         }
 
+    async def run_video_generation(
+        self,
+        account: str,
+        prompts: List[Union[str, tuple]],
+        gateway: str = None,
+        video_params: dict = None,
+        task_id: str = None,
+    ):
+        """
+        独立的视频生成管道，供后台任务直接调用。
+        :param prompts: 可以是纯 str，或者是 (prompt, image_url) 元组（用于 i2v）
+        """
+        if not prompts:
+            return
+
+        from core.services.video_service.defaults import SMART_PRESETS
+        
+        # 应用对应的智能预设 (默认 standard)
+        if not video_params:
+            if gateway in SMART_PRESETS and "standard" in SMART_PRESETS[gateway]:
+                video_params = SMART_PRESETS[gateway]["standard"]
+                logger.info(f"使用 {gateway} 智能预设 (standard): {video_params}")
+
+        # Mapping dictionary
+        GATEWAY_MODEL_MAP = {
+            "wan_2_6":       "wan2.6-i2v",        # WebUI 传 wan_2_6，我们映射到模型名
+            "wan2.6-i2v":    "wan2.6-i2v",
+            "wan2.6-t2v":    "wan2.6-t2v",        # 备用：文生视频
+            "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",
+            "seedance-1.0-pro-fast": "ep-20250218163046-6qbsg", # Need to fix Volcengine inference endpoint
+        }
+        
+        # NOTE: Volcengine needs Endpoint ID, but wait, the API receives the model name or endpoint.
+        # "doubao-seedance-1.0-pro-fast" is usually requested via endpoint ID on Volcengine. But wait, I'll pass the exact string "doubao-seedance-1.0-pro-fast" or endpoint as the user gave unless I must use endpoint. 
+        # Actually the user gave the exact name `Doubao-Seedance-1.0-pro-fast`. So we will use it as is.
+        # So we map "seedance-1.0-pro-fast" to "doubao-seedance-1.0-pro-fast" Wait, let's keep it safe:
+        GATEWAY_MODEL_MAP["seedance-1.0-pro-fast"] = "Doubao-Seedance-1.0-pro-fast"
+        
+        api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)
+
+        # 记录每组任务的最新动态网关
+        current_gateways = {i + 1: gateway for i in range(len(prompts))}
+
+        async def submit_and_wait(prompt_text, idx):
+            from core.api.state import StateKeeper
+            state_keeper = StateKeeper()
+            
+            while True:
+                # 获取当前绑定的 api 实例（如果在重试大循环里被实时修改了）
+                active_gateway = current_gateways[idx]
+                api_model_mapped = GATEWAY_MODEL_MAP.get(active_gateway, active_gateway)
+                from core.services.video_service.factory import get_video_api
+                try:
+                    active_video_api = get_video_api(active_gateway, api_model_mapped)
+                except Exception as e:
+                    logger.error(f"无法初始化最新 API 客户端 {active_gateway}: {e}")
+                    return None
+                    
+                is_i2v = "i2v" in api_model_mapped.lower()
+                submit_sem = self.task_manager.get_video_semaphore()
+                
+                async with submit_sem:
+                    # 提交间隔 — 防止 QPS
+                    await asyncio.sleep((idx - 1) * 2)
+
+                    scene_image_url = ""
+                    if is_i2v:
+                        try:
+                            if isinstance(prompt_text, tuple):
+                                prompt_text, scene_image_url = prompt_text
+                            if not scene_image_url:
+                                logger.warning(f"[Task {idx}] i2v 模式无 image_url，降级为文生视频")
+                        except Exception:
+                            pass
+                            
+                    quota_error_triggered = False
+                    task_id_video = None
+                    
+                    for attempt in range(1, 4):  # 最多 3 次重试提交
+                        try:
+                            task_id_video = await active_video_api.submit_task(
+                                prompt_text,
+                                image_url=scene_image_url,
+                                **(video_params or {})
+                            )
+                            logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id_video}")
+                            break
+                        except Exception as e:
+                            err_str = str(e)
+                            if "401" in err_str or "unauthorized" in err_str.lower() or "quota" in err_str.lower() or "balance" in err_str.lower():
+                                logger.error(f"[Task {idx}] Quota 耗尽或 Token 无效: {err_str}")
+                                quota_error_triggered = True
+                                break # 打破此次提交尝试，进入大轮询等待
+                                
+                            if "Throttling" in err_str and attempt < 3:
+                                wait = attempt * 10
+                                logger.warning(f"[Task {idx}] QPS 限流，{wait}秒后重试 ({attempt}/3)...")
+                                await asyncio.sleep(wait)
+                                continue
+                            logger.error(f"[Task {idx}] 提交失败: {e}")
+                            return None
+                    else:
+                        logger.error(f"[Task {idx}] 重试 3 次均失败（非配额拦截），放弃")
+                        return None
+                        
+                    if quota_error_triggered:
+                        # 抛出配额耗尽事件给前台订阅
+                        if task_id:
+                            await state_keeper.append_log(task_id, {
+                                "stage": "quota_error", 
+                                "status": "error", 
+                                "chapter": f"视频任务 {idx}",
+                                "message": f"[{active_gateway}] 认证失败或配额已耗尽，请在页面左侧切换为可用模型以继续流转！",
+                                "ts": time.time()
+                            }, force_save=True)
+                        
+                        logger.warning(f"⏳ [Task {idx}] 捕获 Quota 拦截异常。挂起线程并轮询等待前端热切换模型...")
+                        
+                        # 每 5 秒检查一次 state_keeper 看网关或模型有没有变
+                        if not task_id:
+                            logger.error(f"[Task {idx}] 没有捕获到全局 task_id，无法热重载网关，直接失败返回。")
+                            return None
+                            
+                        while True:
+                            await asyncio.sleep(5)
+                            master_task = await state_keeper.get_task(task_id)
+                            
+                            is_config_changed = False
+                            if master_task and master_task.get("gateway") and master_task["gateway"] != current_gateways[idx]:
+                                new_gw = master_task["gateway"]
+                                logger.info(f"🔄 [Task {idx}] 侦测到前端已下发热更新命令，网关由 {current_gateways[idx]} 即将迁移至 -> {new_gw}")
+                                current_gateways[idx] = new_gw
+                                is_config_changed = True
+                                
+                            if master_task and master_task.get("aliyun_video_model"):
+                                new_model = master_task["aliyun_video_model"]
+                                # 动态更新内部 params，让下一次循环提交时使用新模型
+                                if video_params and video_params.get("aliyun_video_model") != new_model:
+                                    logger.info(f"🔄 [Task {idx}] 侦测到子模型热更新: {video_params.get('aliyun_video_model')} -> {new_model}")
+                                    if video_params is None: video_params = {}
+                                    video_params["aliyun_video_model"] = new_model
+                                    is_config_changed = True
+
+                            if is_config_changed:
+                                quota_error_triggered = False # 必须释放此拦截标记，否则外层会原地再次拦截
+                                break # 跳出无限等待循环，重新开始外层 while True
+                            
+                            # Phase 9: 显式强制重试 (不换配置)
+                            if master_task and master_task.get("retry_signal"):
+                                logger.info(f"⚡ [Task {idx}] 侦测到强行显式重试指令！打破挂起状态，重新下发请求...")
+                                await state_keeper.update_task(task_id, {"retry_signal": False}, force_save=True)
+                                quota_error_triggered = False # 释放外围拦截标记
+                                break
+                            
+                            if master_task and master_task.get("finished"):
+                                logger.warning(f"🛑 [Task {idx}] 等待期间检测到主任务已被手动中断，安全退出。")
+                                return None
+                                
+                        continue # 开始新的 while True 重新拿着新网关去尝试！
+
+                    # 轮询状态
+                    max_retries = 150
+                    error_strikes = 0  # 连续错误计数器
+                    
+                    for poll_idx in range(max_retries):
+                        await asyncio.sleep(5)
+                        try:
+                            status_info = await active_video_api.check_status(task_id_video)
+                            error_strikes = 0  # 状态查询成功，重置错误统计
+                        except Exception as se:
+                            error_strikes += 1
+                            wait_sec = min(5 * (2 ** (error_strikes - 1)), 60) # 5s, 10s, 20s, 40s, 60s
+                            logger.warning(
+                                f"⚠️ [Task {idx}] 状态查询异常 (连续 {error_strikes} 次) "
+                                f"→ 错误信息: {se}。休眠 {wait_sec}秒 后继续轮询"
+                            )
+                            if error_strikes >= 5:
+                                logger.error(f"❌ [Task {idx}] API 断联 5 次，视为最终失败，结束轮询")
+                                return None
+                            
+                            await asyncio.sleep(wait_sec)
+                            continue
+                            
+                        status = status_info.get("status")
+
+                        if status == "succeeded":
+                            video_url = status_info.get("video_url")
+                            logger.info(f"[Task {idx}] 生成成功! 视频 URL: {video_url}")
+
+                            # 下载逻辑 — 优先 Aria2c，降级 aiohttp
+                            from core.services.download_service import aria2c_service
+                            download_dir = os.path.abspath(
+                                os.path.join(
+                                    os.path.dirname(os.path.abspath(__file__)),
+                                    "..", "Download"
+                                )
+                            )
+                            _novel_id = getattr(self, "_current_novel_id", account)
+                            try:
+                                local_path = await aria2c_service.Aria2cService.smart_download(
+                                    url=video_url,
+                                    novel_id=_novel_id,
+                                    episode_num=idx,
+                                    download_dir=download_dir,
+                                )
+                                logger.info(f"[Task {idx}] ✅ 视频已下载至本地: {local_path}")
+                                return local_path
+                            except Exception as dl_err:
+                                logger.error(f"[Task {idx}] 下载失败: {dl_err}")
+                                return video_url
+
+                        elif status == "failed":
+                            logger.error(f"[Task {idx}] 生成明确失败: {status_info.get('error')}")
+                            return None
+                        elif status in ("running", "queued", "pending"):
+                            logger.debug(f"[Task {idx}] 等待生成中... 最新状态: {status}")
+                        else:
+                            logger.warning(f"[Task {idx}] 遇到未经注册的 API 状态词汇: {status}，视为进行中...")
+                            continue
+
+                    logger.error(f"[Task {idx}] 轮询到达硬上限 ({max_retries}次)，强制超时中止")
+                    return None
+
+        # Gather all tasks
+        tasks = [submit_and_wait(p, i + 1) for i, p in enumerate(prompts)]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        success_count = sum(
+            1 for r in results if r and not isinstance(r, Exception)
+        )
+        logger.info(f"🎥 视频生成批次结束！成功 {success_count}/{len(prompts)} 个。")
+        
+        # 企微播报通知
+        try:
+            from core.services.notify_service import WeChatNotifier
+            WeChatNotifier.send_task_completion(
+                novel_id=account, 
+                scenes_count=len(prompts), 
+                success_count=success_count, 
+                task_id=task_id
+            )
+        except Exception as e:
+            logger.error(f"通知派发失败: {e}")
+
+
     async def process_files_batch(
         self,
         files: list,
@@ -174,6 +423,7 @@ class PipelineOrchestrator:
         on_progress=None,
         task_id: str = "",
         memory_lock: bool = False,
+        image_gateway: str = "aliyun",
     ):
         """
         v2.6.0 批量文件处理入口。
@@ -188,48 +438,71 @@ class PipelineOrchestrator:
         # === Stage1: 同 novel_id 内串行（章节相互依赖）===
         all_scenes = []
         all_visual_prompts = []  # v2.7.0: 收集全量视觉提示词供视频生成调度
+        import gc  # 引入垃圾回收控制内存
+        
         for chapter_idx, file_info in enumerate(files):
-            chapter_name = file_info.get("name", f"chapter_{chapter_idx+1}")
-            chapter_text = file_info.get("content", "")
+            try:
+                chapter_name = file_info.get("name", f"chapter_{chapter_idx+1}")
+                chapter_text = file_info.get("content", "")
+    
+                # 断点续传检查
+                if self.bitable.check_chapter_stage1_done(novel_id, chapter_name):
+                    logger.info(f"⏭️ [断点续传] {chapter_name} 已完成 Stage1，跳过")
+                    if on_progress:
+                        await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, "跳过")
+                    continue
+    
+                # novel_id 粒度锁：同一小说的章节必须按序处理
+                async with self.task_manager.get_novel_lock(novel_id):
+                    if memory_lock:
+                        logger.info(f"🔒 [MemoryLock] 记忆演进逻辑已被锁定，跳过 {chapter_name} 的记忆提取")
+                        result = {"status": "success", "message": "Memory lock enabled, skipped."}
+                    else:
+                        result = await MemoryEngine.evolve_memory(
+                            novel_id=novel_id,
+                            chapter_text=chapter_text,
+                            chapter_name=chapter_name,
+                            bitable=self.bitable,
+                            chapter_index=chapter_idx,
+                        )
+                    
+                    if result["status"] not in ("success", "partial_error"):
+                        logger.error(f"❌ Stage1 失败: {chapter_name} -> {result.get('message')}")
+                        if on_progress:
+                            await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, result["status"])
+                        continue # 跳过本章后续处理
 
-            # 断点续传检查
-            if self.bitable.check_chapter_stage1_done(novel_id, chapter_name):
-                logger.info(f"⏭️ [断点续传] {chapter_name} 已完成 Stage1，跳过")
+                    if on_progress:
+                        await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, result["status"])
+
+                    # === Stage 1.5: 视觉锚定初始化（仅对 present_in_current=True 的实体）===
+                    stage1_entities = result.get("stage1_entities", [])
+                    if stage1_entities and not memory_lock:
+                        logger.info(f"➡️ [交接] {chapter_name} 传递了 {len(stage1_entities)} 个出场实体，开始 Stage 1.5...")
+                        try:
+                            await self._run_stage1_5(
+                                novel_id=novel_id,
+                                chapter_name=chapter_name,
+                                present_entities=stage1_entities,
+                                image_gateway=image_gateway,
+                                task_id=task_id,
+                            )
+                        except Exception as s15_err:
+                            # Fail-Fast: 若资产构建崩溃，全链条截断
+                            logger.error(f"🚨 [Stage1.5] 构建视觉资产严重失败: {s15_err}，终止生成流！")
+                            raise
+
+                    # ★★★ 原子级断点续传核心修改 ★★★
+                    # 只有当 Stage1 解析和 Stage1.5 生图配图**全都成功**通过后，
+                    # 才会真正在飞书/DB标记本章 "Stage1=完成"
+                    self.bitable.mark_chapter_stage1_complete(novel_id, chapter_name)
+                    logger.info(f"✅ [Stage1 & 1.5 原子事务] {chapter_name} 彻底解析并配图完毕，打上完成标记。")
+    
+            except Exception as e:
+                logger.error(f"❌ [Stage1] 处理章节 {chapter_name} 失败: {e}")
                 if on_progress:
-                    await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, "跳过")
-                continue
-
-            # novel_id 粒度锁：同一小说的章节必须按序处理
-            async with self.novel_locks[novel_id]:
-                if memory_lock:
-                    logger.info(f"🔒 [MemoryLock] 记忆演进逻辑已被锁定，跳过 {chapter_name} 的记忆提取")
-                    result = {"status": "success", "message": "Memory lock enabled, skipped."}
-                else:
-                    result = await MemoryEngine.evolve_memory(
-                        novel_id=novel_id,
-                        chapter_text=chapter_text,
-                        chapter_name=chapter_name,
-                        bitable=self.bitable,
-                        chapter_index=chapter_idx,
-                    )
-                
-                if result["status"] not in ("success", "partial_error"):
-                    logger.error(f"❌ Stage1 失败: {chapter_name} -> {result.get('message')}")
-                if on_progress:
-                    await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, result["status"])
-
-            # 无论是否 memory_lock 都必须做 Stage1_done 标记，以便断点续传后续
-            if result["status"] in ("success", "partial_error"):
-                self.bitable.mark_chapter_stage1_complete(novel_id, chapter_name)
-
-                # === Stage 1.5: 视觉锚定初始化（仅对 present_in_current=True 的实体）===
-                stage1_entities = result.get("stage1_entities", [])
-                if stage1_entities and not memory_lock:
-                    await self._run_stage1_5(
-                        novel_id=novel_id,
-                        chapter_name=chapter_name,
-                        present_entities=stage1_entities,
-                    )
+                    await on_progress("stage1", chapter_idx + 1, len(files), chapter_name, "error")
+                continue # 继续处理下一章
 
         # === Stage2: 严格章节顺序串行 + 每章 Semaphore(3) 内并发 + 3次重试 ===
         # 章节顺序强保证: 1→N 一个不跳过，确保剧情发展不乱序
@@ -340,16 +613,16 @@ class PipelineOrchestrator:
                 gateway=gateway,
             )
             all_scenes.extend(chapter_scenes)
-            # === Scene-Asset \u7ed1\u5b9a\uff1a\u4e3a i2v \u6a21\u5f0f\u67e5\u8be2\u5206\u955c\u5bf9\u5e94\u7684\u5b9e\u4f53\u56fe\u7247 URL ===
+            # === Scene-Asset 绑定：为 i2v 模式查询分镜对应的实体图片 URL ===
             if not sandbox_mode:
-                # \u6536\u96c6\u672c\u7ae0\u6240\u6709\u5206\u955c\u7684\u72ec\u7acb entity_id
+                # 收集本章所有分镜的独立 entity_id
                 chapter_entity_ids = set()
                 for sc in chapter_scenes:
                     for eid in (sc.get("entity_ids") or []):
                         if eid:
                             chapter_entity_ids.add(str(eid))
 
-                # \u5e76\u53d1\u4ece\u98de\u4e66\u7d20\u6750\u8868\u67e5\u8be2\u5bf9\u5e94\u5b9e\u4f53\u7684\u56fe\u7247 URL
+                # 并发从飞书素材表查询对应实体的图片 URL
                 asset_cache: dict = {}
                 if chapter_entity_ids:
                     async def _fetch_one(eid: str):
@@ -369,11 +642,11 @@ class PipelineOrchestrator:
                         if not isinstance((eid, url), Exception) and isinstance(url, str) and url
                     }
                     logger.info(
-                        f"\ud83d\uddbc\ufe0f [Stage3-Bind] {chapter_name_s2}: "
-                        f"{len(asset_cache)}/{len(chapter_entity_ids)} \u4e2a\u5b9e\u4f53\u5339\u914d\u5230\u56fe\u7247"
+                        f"[Stage3-Bind] {chapter_name_s2}: "
+                        f"{len(asset_cache)}/{len(chapter_entity_ids)} 个实体匹配到图片"
                     )
 
-                # \u6253\u5305 (prompt, image_url) \u5143\u7ec4\uff1b\u65e0\u56fe\u964d\u7ea7\u4e3a\u7eaf prompt\uff08t2v fallback\uff09
+                # 打包 (prompt, image_url) 元组；无图降级为纯 prompt（t2v fallback）
                 for sc in chapter_scenes:
                     vp = sc.get("visual_prompt", "")
                     if not (vp and isinstance(vp, str) and len(vp) > 10):
@@ -388,18 +661,22 @@ class PipelineOrchestrator:
             logger.info(f"📌 [Stage2] {chapter_name_s2} 写入 {len(ids)} 条，集数 {start_ep}~{episode_counter[0]-1}")
             if on_progress:
                 await on_progress("stage2", ch_idx + 1, len(files), chapter_name_s2, "success")
+                
+            # 极致内存保护：整个章节被分镜拆分完毕并落地后，销毁原文缓存
+            if "content" in file_info:
+                file_info["content"] = ""
+            gc.collect()
         # === Stage3: 视频生成调度（生产模式且有分镜时自动派发）===
         if not sandbox_mode and all_visual_prompts:
             logger.info(
                 f"🎥 [Stage3] 生产模式开启，自动派发视频生成: {len(all_visual_prompts)} 个分镜 → gateway={gateway}"
             )
-            asyncio.create_task(
-                self.run_video_generation(
-                    account=novel_id,
-                    prompts=all_visual_prompts,
-                    gateway=gateway,
-                    video_params=video_params
-                )
+            await self.run_video_generation(
+                account=novel_id,
+                prompts=all_visual_prompts,
+                gateway=gateway,
+                video_params=video_params,
+                task_id=task_id  # 传递 task_id 用于状态跟踪和实时切换配置
             )
         elif sandbox_mode:
             logger.info("📦 [沿箱模式] 视频生成未派发（sandbox_mode=True）")
@@ -419,12 +696,14 @@ class PipelineOrchestrator:
         novel_id: str,
         chapter_name: str,
         present_entities: list,
+        image_gateway: str = "aliyun",
+        task_id: str = "",
     ) -> None:
         """
         Stage 1.5: 视觉锚定初始化。
 
         对本章 present_in_current=True 的实体列表进行三路判断：
-          A. 无图→ DeepSeek 生成英文 Prompt → Pollinations 生图 → 写入飞书
+          A. 无图→ DeepSeek 生成英文 Prompt → 生图API → 写入飞书
           B. 有图 + lore 变化→ 迭代模式（保留旧 seed，新 evolution_lore）
              同时将旧 visual_prompt 历史快照 按章节标签归档
           C. 无变化→ 透传，跳过 API 调用
@@ -432,9 +711,21 @@ class PipelineOrchestrator:
         if not present_entities:
             return
 
-        image_svc = AliyunImageService()   # qwen-image-plus via DashScope
-        logger.info("🎨 [Stage1.5] 使用阿里云 qwen-image-plus 生图")
+        from core.api.state import StateKeeper
+        state_keeper = StateKeeper()
+        
+        # 包装器，用于在遇到配额错误时热重载 image_svc
+        async def init_image_svc(gateway_name):
+            if gateway_name == "aliyun":
+                return AliyunImageService(model="qwen-image-plus")
+            elif gateway_name == "z_image_turbo":
+                return AliyunImageService(model="z-image-turbo")
+            # 预留给智谱、midjourney 等其他生图服务接入...
+            return AliyunImageService(model="qwen-image-plus")
+
         sem = asyncio.Semaphore(2)  # 防止并发过高限流
+        # 创建一个 list 穿透闭包以便于更新，索引 0
+        current_gateways = [image_gateway]
 
         async def _process_one(entity: dict):
             entity_id = entity["entity_id"]
@@ -469,59 +760,126 @@ class PipelineOrchestrator:
                     elif new_lore:
                         evolution_lore = f"本章新增设定：{new_lore[:200]}"
 
-                # DeepSeek 生成英文 Prompt
-                visual_prompt = await asyncio.to_thread(
-                    DeepSeekService.generate_visual_prompt,
-                    entity,
-                    evolution_lore,
-                    old_prompt,
-                )
+                while True:
+                    # 每次拉取最新的网关实例
+                    active_gateway = current_gateways[0]
+                    try:
+                        image_svc = await init_image_svc(active_gateway)
+                    except Exception as ie:
+                        logger.error(f"无法初始化生图客户端 {active_gateway}: {ie}")
+                        # 延迟等待避免死循环
+                        await asyncio.sleep(5)
+                        continue
 
-                if not visual_prompt:
-                    logger.warning(f"⚠️ [Stage1.5] {entity_name} Prompt 生成失败，跳过")
-                    return
-
-                # 生图（迭代时复用旧 seed，保持视觉 DNA 延续）
-                if is_evolution and old_seed:
-                    img_result = await image_svc.evolve_image(
-                        original_seed=old_seed,
-                        evolution_prompt=visual_prompt,
-                    )
-                else:
-                    img_result = await image_svc.generate_image(
-                        prompt=visual_prompt,
+                    # DeepSeek 生成英文 Prompt
+                    visual_prompt = await asyncio.to_thread(
+                        DeepSeekService.generate_visual_prompt,
+                        entity,
+                        evolution_lore,
+                        old_prompt,
                     )
 
-                if img_result.get("status") != "success":
-                    logger.error(
-                        f"❌ [Stage1.5] {entity_name} 生图失败: {img_result}"
+                    if not visual_prompt:
+                        logger.warning(f"⚠️ [Stage1.5] {entity_name} Prompt 生成失败，可能被过滤")
+                        # 生图提示词失败视为严重跳过
+                        break
+
+                    quota_error_triggered = False
+                    img_result = {}
+                    
+                    try:
+                        # 生图（迭代时复用旧 seed，保持视觉 DNA 延续）
+                        if is_evolution and old_seed:
+                            img_result = await image_svc.evolve_image(
+                                original_seed=old_seed,
+                                evolution_prompt=visual_prompt,
+                            )
+                        else:
+                            img_result = await image_svc.generate_image(
+                                prompt=visual_prompt,
+                            )
+                    except Exception as e:
+                        err_str = str(e)
+                        if "401" in err_str or "unauthorized" in err_str.lower() or "quota" in err_str.lower() or "balance" in err_str.lower() or "Arrearage" in err_str:
+                            logger.error(f"[Stage1.5] {active_gateway} 生图配额拦截: {err_str}")
+                            quota_error_triggered = True
+                        else:
+                            logger.error(f"❌ [Stage1.5] {entity_name} 网关底层调用失败: {err_str}")
+                            # 并非配额问题，不陷入挂起死循环，直接返回跳过该图
+                            break
+
+                    if quota_error_triggered:
+                        if task_id:
+                            await state_keeper.append_log(task_id, {
+                                "stage": "quota_error", 
+                                "status": "error", 
+                                "chapter": f"生图任务 ({entity_name})",
+                                "message": f"[{active_gateway}] 账户生图配额耗尽或密钥无效！请在左侧切换【生图模型】以继续补齐残缺的剧集资产。",
+                                "ts": time.time()
+                            }, force_save=True)
+                            
+                        logger.warning(f"⏳ [Stage1.5] {entity_name} 制图被挂起！等待前端热切换生图模型指令...")
+                        
+                        if not task_id:
+                            logger.error(f"没有全局 task_id，无法热重载生图网关，强行中止本实体的处理。")
+                            break
+                        
+                        # 陷入心跳轮询，等待换模型
+                        while True:
+                            await asyncio.sleep(5)
+                            master_task = await state_keeper.get_task(task_id)
+                            # 假设前端通过同样的 udpate_config 更新了 image_gateway 字段
+                            db_image_gw = master_task.get("image_gateway", active_gateway)
+                            if db_image_gw != active_gateway:
+                                logger.info(f"🔄 [Stage1.5] 侦测到生图网关热更新命令！{active_gateway} -> {db_image_gw}")
+                                current_gateways[0] = db_image_gw
+                                quota_error_triggered = False # 重置拦截标记
+                                break # 跳出无限等待，重新开始外层 while True
+                            
+                            # Phase 9: 显式强制重试 (不换配额/配置)
+                            if master_task and master_task.get("retry_signal"):
+                                logger.info(f"⚡ [Stage1.5] 侦测到生图任务强行显式重试指令！打破挂起状态，重试API...")
+                                await state_keeper.update_task(task_id, {"retry_signal": False}, force_save=True)
+                                quota_error_triggered = False # 重置拦截标记
+                                break
+                            
+                            if master_task and master_task.get("finished"):
+                                logger.warning(f"🛑 [Stage1.5] 用户按下了手动终止。")
+                                return
+                        
+                        continue # 回到顶端使用新 gw 重新尝试
+                        
+                    if img_result.get("status") != "success":
+                        logger.error(
+                            f"❌ [Stage1.5] {entity_name} 生图遭到云端拒绝: {img_result}"
+                        )
+                        break
+                    else:
+                        logger.info(f"🟢 [Stage1.5] {entity_name} 生图成功: URL={img_result.get('url')[:60]}")
+
+                    image_url = img_result["url"]
+                    seed = img_result["seed"]
+
+                    # 写入飞书素材表（版本化，旧 prompt 自动归档进历史快照）
+                    await asyncio.to_thread(
+                        self.bitable.upsert_asset_record,
+                        novel_id=novel_id,
+                        entity_id=entity_id,
+                        entity_name=entity_name,
+                        asset_type=asset_type,
+                        visual_prompt=visual_prompt,
+                        image_url=image_url,
+                        seed=seed,
+                        chapter_tag=chapter_name,
+                        is_evolution=is_evolution,
+                        old_visual_prompt=old_prompt,
                     )
-                    return
-                else:
-                    logger.info(f"🟢 [Stage1.5] {entity_name} 生图成功: URL={img_result.get('url')[:60]}")
 
-                image_url = img_result["url"]
-                seed = img_result["seed"]
-
-                # 写入飞书素材表（版本化，旧 prompt 自动归档进历史快照）
-                await asyncio.to_thread(
-                    self.bitable.upsert_asset_record,
-                    novel_id=novel_id,
-                    entity_id=entity_id,
-                    entity_name=entity_name,
-                    asset_type=asset_type,
-                    visual_prompt=visual_prompt,
-                    image_url=image_url,
-                    seed=seed,
-                    chapter_tag=chapter_name,
-                    is_evolution=is_evolution,
-                    old_visual_prompt=old_prompt,
-                )
-
-                logger.info(
-                    f"✅ [Stage1.5] {entity_name} @{chapter_name} "
-                    f"{'[EVOLVE]' if is_evolution else '[INIT]'} 完成"
-                )
+                    logger.info(
+                        f"✅ [Stage1.5] {entity_name} @{chapter_name} "
+                        f"{'[EVOLVE]' if is_evolution else '[INIT]'} 完美落表"
+                    )
+                    break # 成功走完实体处理，跳出 `while True`
 
         # 并发处理本章所有实体
         tasks = [_process_one(e) for e in present_entities]
@@ -535,176 +893,5 @@ class PipelineOrchestrator:
             f"🎬 [Stage1.5] 章节={chapter_name} 共处理 {len(present_entities)} 个实体"
         )
 
-    async def run_video_generation(self, account: str, prompts: list, gateway: str = "seedance-1.5-pro", video_params: dict = None):
-        """
-        Since we moved away from Playwright and to API-driven interfaces,
-        this will use the configured Model API backend based on 'gateway'.
-        """
-        logger.info(f"=== 开始 API 驱动视频生成流程 (Account: {account}, 模型: {gateway}) ===")
 
-        # 网关标识字符串 → DashScope 实际 model 名称映射
-        GATEWAY_MODEL_MAP = {
-            "wan_2_6":       "wan2.6-i2v",        # 阿里云 i2v（图生视频）— 默认
-            "wan2.6":        "wan2.6-i2v",
-            "wan2.6-i2v":    "wan2.6-i2v",
-            "wan2.6-t2v":    "wan2.6-t2v",        # 备用：文生视频
-            "seedance-1.5-pro": "doubao-seedance-1-5-pro-251215",
-            "seedance-1.0-pro-fast": "ep-20250218163046-6qbsg", # Need to fix Volcengine inference endpoint
-        }
-        
-        # NOTE: Volcengine needs Endpoint ID, but wait, the API receives the model name or endpoint.
-        # "doubao-seedance-1.0-pro-fast" is usually requested via endpoint ID on Volcengine. But wait, I'll pass the exact string "doubao-seedance-1.0-pro-fast" or endpoint as the user gave unless I must use endpoint. 
-        # Actually the user gave the exact name `Doubao-Seedance-1.0-pro-fast`. So we will use it as is.
-        # So we map "seedance-1.0-pro-fast" to "doubao-seedance-1.0-pro-fast" Wait, let's keep it safe:
-        GATEWAY_MODEL_MAP["seedance-1.0-pro-fast"] = "Doubao-Seedance-1.0-pro-fast"
-        
-        api_model = GATEWAY_MODEL_MAP.get(gateway, gateway)
-
-        # Dynamically load the correct class
-        if "seedance" in gateway.lower() or "volcengine" in gateway.lower() or gateway == "API_MODE":
-            from core.services.video_service.volcengine_service import VolcengineVideoAPI
-            api_key = os.environ.get("VOLCENGINE_API_KEY", "")
-            if not api_key:
-                logger.error("❌ [VideoGen] VOLCENGINE_API_KEY 未配置，无法初始化火山引擎")
-                return
-            try:
-                video_api = VolcengineVideoAPI(api_key=api_key, model_id=api_model)
-            except Exception as e:
-                logger.error(f"无法初始化火山引擎 API 客户端: {e}")
-                return
-        elif "wan2.6" in gateway.lower() or "wan_2_" in gateway.lower() or "aliyun" in gateway.lower():
-            from core.services.video_service.aliyun_service import Wan2_6VideoAPI
-            aliyun_key = os.environ.get("ALIYUN_API_KEY", "") or os.environ.get("DASHSCOPE_API_KEY", "")
-            if not aliyun_key:
-                logger.error("❌ [VideoGen] ALIYUN_API_KEY 未配置，无法初始化阿里遗子 API")
-                return
-            try:
-                video_api = Wan2_6VideoAPI(api_key=aliyun_key, model=api_model)
-            except Exception as e:
-                logger.error(f"无法初始化阿里百炼 API 客户端: {e}")
-                return
-        else:
-            logger.error(f"不支持的网关模型类型: {gateway}")
-            return
-            
-        logger.info(f"收到 {len(prompts)} 个分镜，开始限流并行视频生成 (Semaphore=3, 间隔 2s, 模型={api_model})...")
-        is_i2v = "i2v" in api_model.lower()
-        if is_i2v:
-            logger.info("🖼️ [Stage3] i2v 模式: 将从飞书素材表召回对应分镜的图片 URL")
-
-        # 并发控制：Semaphore(3) 限制同时提交数
-        submit_sem = asyncio.Semaphore(3)
-
-        async def submit_and_wait(prompt_text, idx):
-            async with submit_sem:
-                # 提交间隔 — 防止 QPS 这突破
-                await asyncio.sleep((idx - 1) * 2)
-
-                # i2v 模式：从飞书素材表查对应分镜的图片 URL
-                scene_image_url = ""
-                if is_i2v:
-                    try:
-                        # 尝试从分镜内嵌元数据提取 image_url
-                        if isinstance(prompt_text, tuple):
-                            prompt_text, scene_image_url = prompt_text
-                        if not scene_image_url:
-                            logger.warning(
-                                f"[Task {idx}] i2v 模式无 image_url，降级为文生视频"
-                            )
-                    except Exception:
-                        pass
-                for attempt in range(1, 4):  # 最多 3 次重试
-                    try:
-                        task_id = await video_api.submit_task(
-                            prompt_text,
-                            image_url=scene_image_url,  # i2v 传入，t2v/seedance 忽略
-                            **(video_params or {})
-                        )
-                        logger.info(f"[Task {idx}] 提交成功，任务 ID: {task_id}")
-                        break
-                    except Exception as e:
-                        err_str = str(e)
-                        if "Throttling" in err_str and attempt < 3:
-                            wait = attempt * 10
-                            logger.warning(
-                                f"[Task {idx}] QPS 限流，{wait}秒后重试 "
-                                f"({attempt}/3)..."
-                            )
-                            await asyncio.sleep(wait)
-                            continue
-                        logger.error(f"[Task {idx}] 提交失败: {e}")
-                        return None
-                else:
-                    logger.error(f"[Task {idx}] 重试 3 次均失败，放弃")
-                    return None
-
-                # 轮询状态
-                max_retries = 150
-                error_strikes = 0  # 连续错误计数器
-
-                for poll_idx in range(max_retries):
-                    await asyncio.sleep(5)
-                    try:
-                        status_info = await video_api.check_status(task_id)
-                        error_strikes = 0  # 状态查询成功，重置错误统计
-                    except Exception as se:
-                        error_strikes += 1
-                        wait_sec = min(5 * (2 ** (error_strikes - 1)), 60) # 5s, 10s, 20s, 40s, 60s
-                        logger.warning(
-                            f"⚠️ [Task {idx}] 状态查询异常 (连续 {error_strikes} 次) "
-                            f"→ 错误信息: {se}。休眠 {wait_sec}秒 后继续轮询"
-                        )
-                        if error_strikes >= 5:
-                            logger.error(f"❌ [Task {idx}] API 断联 5 次，视为最终失败，结束轮询")
-                            return None
-                        
-                        await asyncio.sleep(wait_sec)
-                        continue
-                        
-                    status = status_info.get("status")
-
-                    if status == "succeeded":
-                        video_url = status_info.get("video_url")
-                        logger.info(f"[Task {idx}] 生成成功! 视频 URL: {video_url}")
-
-                        # 下载逻辑 — 优先 Aria2c，降级 aiohttp
-                        download_dir = os.path.abspath(
-                            os.path.join(
-                                os.path.dirname(os.path.abspath(__file__)),
-                                "..", "Download"
-                            )
-                        )
-                        _novel_id = getattr(self, "_current_novel_id", "")
-                        try:
-                            local_path = await Aria2cService.smart_download(
-                                url=video_url,
-                                novel_id=_novel_id,
-                                episode_num=idx,
-                                download_dir=download_dir,
-                            )
-                            logger.info(f"[Task {idx}] ✅ 视频已下载至本地: {local_path}")
-                            return local_path
-                        except Exception as dl_err:
-                            logger.error(f"[Task {idx}] 下载失败: {dl_err}")
-                            return video_url
-
-                    elif status == "failed":
-                        logger.error(f"[Task {idx}] 生成明确失败: {status_info.get('error')}")
-                        return None
-                    elif status in ("running", "queued", "pending"):
-                        logger.debug(f"[Task {idx}] 等待生成中... 最新状态: {status}")
-                    else:
-                        logger.warning(f"[Task {idx}] 遇到未经注册的 API 状态词汇: {status}，视为进行中...")
-                        continue
-
-                logger.error(f"[Task {idx}] 轮询到达硬上限 ({max_retries}次)，强制超时中止")
-                return None
-
-        tasks = [submit_and_wait(p, i + 1) for i, p in enumerate(prompts)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        success_count = sum(
-            1 for r in results if r and not isinstance(r, Exception)
-        )
-        logger.info(f"� 视频生成批次结束！成功 {success_count}/{len(prompts)} 个。")
 

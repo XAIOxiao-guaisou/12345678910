@@ -1,3 +1,4 @@
+from core.config import settings
 """
 aria2c_service.py — v2.6.0 Aria2c 断点续传下载服务
 
@@ -26,8 +27,8 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-ARIA2_RPC_URL    = os.environ.get("ARIA2_RPC_URL",    "http://localhost:6800/jsonrpc")
-ARIA2_RPC_SECRET = os.environ.get("ARIA2_RPC_SECRET", "")
+ARIA2_RPC_URL    = settings.ARIA2_RPC_URL
+ARIA2_RPC_SECRET = settings.ARIA2_RPC_SECRET
 
 # 默认下载根目录（绝对路径）
 _BASE_DOWNLOAD_DIR = os.path.abspath(

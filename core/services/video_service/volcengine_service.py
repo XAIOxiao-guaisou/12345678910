@@ -1,3 +1,4 @@
+from core.config import settings
 import os
 import asyncio
 import logging
@@ -10,7 +11,7 @@ logger = logging.getLogger(__name__)
 class VolcengineVideoAPI(BaseVideoGeneratorAPI):
     def __init__(self, api_key: str = None, model_id: str = "doubao-seedance-1-5-pro-251215"):
         # 如果没有传入 API Key，尝试从环境变量获取
-        api_key = api_key or os.environ.get("VOLCENGINE_API_KEY", "")
+        api_key = api_key or settings.VOLCENGINE_API_KEY
         super().__init__(api_key)
         self.model_id = model_id
         if not self.api_key:
@@ -19,25 +20,38 @@ class VolcengineVideoAPI(BaseVideoGeneratorAPI):
         else:
             self.client = Ark(api_key=self.api_key)
 
-    async def submit_task(self, prompt: str, **kwargs) -> str:
+    async def submit_task(self, prompt: str, image_url: str = "", **kwargs) -> str:
+        """
+        提交视频生成任务。
+        v2.8.0: image_url 从 **kwargs 升级为显式参数，支持 Seedance I2V 模式。
+        Args:
+            prompt    : 视频文字描述
+            image_url : 非空时，构建 I2V 混合内容（image + text），走图生视频端点
+        """
         if not self.client:
             raise ValueError("Volcengine API Key not configured.")
-        
-        logger.info(f"Submitting video task to Volcengine (Model: {self.model_id}). Prompt: {prompt[:50]}...")
-        
-        # Volcengine SDK is synchronous for this endpoint by default (unless using AsyncArk),
-        # but the task submit API returns quickly with a task ID.
+
+        # 构建内容列表（I2V 时，image 在 text 之前）
+        if image_url:
+            content = [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": prompt},
+            ]
+            logger.info(
+                f"[Seedance I2V] Submitting task (Model: {self.model_id}). "
+                f"image_url={image_url[:60]}... prompt={prompt[:40]}..."
+            )
+        else:
+            content = [{"type": "text", "text": prompt}]
+            logger.info(
+                f"[Seedance T2V] Submitting task (Model: {self.model_id}). Prompt: {prompt[:50]}..."
+            )
+
         try:
-            # We can use asyncio.to_thread if we want to avoid blocking the event loop
             response = await asyncio.to_thread(
                 self.client.content_generation.tasks.create,
                 model=self.model_id,
-                content=[
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
+                content=content,
             )
             task_id = response.id
             logger.info(f"Task submitted successfully. Task ID: {task_id}")
