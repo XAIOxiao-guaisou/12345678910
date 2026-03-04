@@ -1348,3 +1348,69 @@ class FeishuBitableManager:
         except Exception as e:
             logger.error(f"update_storyboard_with_lock_check 异常: {e}")
             return ""
+
+    def get_stuck_frozen_tasks(self, hours_threshold: float = 2.0) -> list:
+        """
+        v3.0.0-PRO: 检索处于 冻结 状态并且超时的任务（死锁检测）。
+        此方法用于 TaskManager 定时轮询和管理员紧急重置。
+        """
+        search_url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+            f"/tables/{TABLE_SCRIPT}/records/search"
+        )
+        stuck_tasks = []
+        try:
+            payload = {
+                "filter": {
+                    "conjunction": "and",
+                    "conditions": [
+                        {"field_name": "Storage_Zone", "operator": "is", "value": ["冻结"]}
+                    ]
+                },
+                "page_size": 500
+            }
+            resp = requests.post(search_url, headers=self._get_headers(), json=payload)
+            resp.raise_for_status()
+            data = resp.json().get("data", {})
+            
+            current_time = int(time.time() * 1000) # ms
+            threshold_ms = hours_threshold * 3600 * 1000
+            
+            for r in data.get("items", []):
+                # last_modified_time in Bitable API v1 is milliseconds
+                last_modified = r.get("last_modified_time", 0)
+                if current_time - last_modified > threshold_ms:
+                    fields = r.get("fields", {})
+                    stuck_tasks.append({
+                        "record_id": r["record_id"],
+                        "task_id": self._flatten(fields.get("任务ID", "")),
+                        "gateway": self._flatten(fields.get("所属模型/网关", ""))
+                    })
+            return stuck_tasks
+        except Exception as e:
+            logger.error(f"get_stuck_frozen_tasks 检索异常: {e}")
+            return []
+
+    def force_unlock_task(self, record_id: str) -> bool:
+        """
+        v3.0.0-PRO: 强制解除分镜物理锁，放流回草稿区。
+        """
+        url = (
+            f"https://open.feishu.cn/open-apis/bitable/v1/apps/{APP_TOKEN_SCRIPT}"
+            f"/tables/{TABLE_SCRIPT}/records/{record_id}"
+        )
+        try:
+            resp = requests.put(
+                url,
+                headers=self._get_headers(),
+                json={"fields": {
+                    "Row_Lock": False,
+                    "Storage_Zone": "草稿"
+                }}
+            )
+            resp.raise_for_status()
+            logger.info(f"🔓 [死锁释放] 分镜记录 {record_id} 物理锁解除，返回草稿区！")
+            return True
+        except Exception as e:
+            logger.error(f"force_unlock_task 异常: {e}")
+            return False

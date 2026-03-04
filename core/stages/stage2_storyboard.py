@@ -91,18 +91,27 @@ class StoryboardStage(BaseStage):
                             
                         if base_asset:
                             logger.info(f"🧬 [Stage2.5] 为分镜衍生实体 {eid} 的视觉帧...")
-                            try:
-                                derived_result = await derivation_engine.derive_scene_frame(
-                                    entity_id=str(eid),
-                                    base_image_url=base_asset.get("image_url", ""),
-                                    visual_anchor_prompt=base_asset.get("visual_prompt", ""),
-                                    dynamic_description=sc.get("summary", ""),
-                                    base_seed=base_asset.get("seed", 0)
-                                )
-                                if derived_result.get("status") == "success" and derived_result.get("url"):
-                                    img_urls.append(derived_result["url"])
-                            except Exception as e:
-                                logger.error(f"衍生失败: {e}")
+                            derived_success = False
+                            for attempt in range(3):
+                                try:
+                                    derived_result = await derivation_engine.derive_scene_frame(
+                                        entity_id=str(eid),
+                                        base_image_url=base_asset.get("image_url", ""),
+                                        visual_anchor_prompt=base_asset.get("visual_prompt", ""),
+                                        dynamic_description=sc.get("summary", ""),
+                                        base_seed=base_asset.get("seed", 0)
+                                    )
+                                    if derived_result.get("status") == "success" and derived_result.get("url"):
+                                        img_urls.append(derived_result["url"])
+                                        derived_success = True
+                                        break
+                                except Exception as e:
+                                    wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                                    logger.warning(f"⚠️ 衍生失败 (尝试 {attempt+1}/3): {e}. 等待 {wait_time}s 后重试...")
+                                    await asyncio.sleep(wait_time)
+                            
+                            if not derived_success:
+                                logger.warning(f"🚨 [高亮 WARNING] 实体 {eid} 衍生彻底失败，丢失动态演进细节，降级回基准图！")
                                 if base_asset.get("image_url"):
                                     img_urls.append(base_asset["image_url"])
                                     

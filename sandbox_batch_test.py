@@ -66,24 +66,34 @@ def health_check():
 
 def submit_batch(chapters):
     """提交批量任务，返回 task_id"""
-    payload = {
+    data = {
         "novel_id":     NOVEL_ID,
-        "files":        chapters,
         "style":        STYLE,
         "gateway":      GATEWAY,
-        "sandbox_mode": SANDBOX_MODE,
-        "video_params": {},
+        "image_gateway": "aliyun",
+        "sandbox_mode": str(SANDBOX_MODE).lower(),
+        "aliyun_image_model": "wan2.6-t2i",
+        "aliyun_video_model": "wan2.6-i2v-flash",
+        "tts_voice": "Cherry",
+        "aspect_ratio": "16:9",
+        "segmented_processing": "auto"
     }
+    
+    files_payload = []
+    for c in chapters:
+        # requests requires tuple (filename, fileobj)
+        files_payload.append(("files", (c["name"], c["content"])))
+        
     log(YELLOW, "SUBMIT", f"提交 {len(chapters)} 个章节 → /api/upload_novel_batch ...")
-    r = requests.post(f"{BASE_URL}/api/upload_novel_batch", json=payload, timeout=30)
+    r = requests.post(f"{BASE_URL}/api/upload_novel_batch", data=data, files=files_payload, timeout=30)
     if r.status_code != 200:
         log(RED, "ERROR", f"HTTP {r.status_code}: {r.text[:300]}")
         sys.exit(1)
-    data = r.json()
-    if data.get("status") != "ok":
-        log(RED, "ERROR", f"提交失败: {data}")
+    data_json = r.json()
+    if data_json.get("status") != "ok":
+        log(RED, "ERROR", f"提交失败: {data_json}")
         sys.exit(1)
-    task_id = data["task_id"]
+    task_id = data_json["task_id"]
     log(GREEN, "SUBMIT", f"任务已入队 task_id={task_id}")
     return task_id
 
