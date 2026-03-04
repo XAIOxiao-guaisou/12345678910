@@ -70,23 +70,43 @@ class StoryboardStage(BaseStage):
             )
             context.all_scenes.extend(chapter_scenes)
 
-            # 装配 (prompt, image_url) 供 Stage3
+            # 装配 (prompt, image_urls) 供 Stage3
             if not context.sandbox_mode:
                 asset_cache = await self._fetch_asset_cache(context, chapter_scenes)
+                from core.services.image_service.derivation_engine import DerivationEngine
+                derivation_engine = DerivationEngine(backend="aliyun")
+                
                 for sc in chapter_scenes:
                     vp_str = sc.get("visual_prompt", "")
                     if not (vp_str and isinstance(vp_str, str) and len(vp_str) > 10):
                         continue
-                    img_url = ""
+                    
+                    img_urls = []
                     for eid in (sc.get("entity_ids") or []):
-                        # 优先用 scene_frame_urls（I2V 正确资产），降级查 asset_cache（飞书表）
+                        base_asset = None
                         if str(eid) in context.scene_frame_urls:
-                            img_url = context.scene_frame_urls[str(eid)]
-                            break
-                        if str(eid) in asset_cache:
-                            img_url = asset_cache[str(eid)]
-                            break
-                    context.visual_prompts.append((vp_str, img_url) if img_url else vp_str)
+                            base_asset = {"image_url": context.scene_frame_urls[str(eid)], "seed": 0}
+                        elif str(eid) in asset_cache:
+                            base_asset = asset_cache[str(eid)]
+                            
+                        if base_asset:
+                            logger.info(f"🧬 [Stage2.5] 为分镜衍生实体 {eid} 的视觉帧...")
+                            try:
+                                derived_result = await derivation_engine.derive_scene_frame(
+                                    entity_id=str(eid),
+                                    base_image_url=base_asset.get("image_url", ""),
+                                    visual_anchor_prompt=base_asset.get("visual_prompt", ""),
+                                    dynamic_description=sc.get("summary", ""),
+                                    base_seed=base_asset.get("seed", 0)
+                                )
+                                if derived_result.get("status") == "success" and derived_result.get("url"):
+                                    img_urls.append(derived_result["url"])
+                            except Exception as e:
+                                logger.error(f"衍生失败: {e}")
+                                if base_asset.get("image_url"):
+                                    img_urls.append(base_asset["image_url"])
+                                    
+                    context.visual_prompts.append((vp_str, img_urls) if img_urls else vp_str)
 
             logger.info(
                 f"[Stage2] {chapter_name} 写入 {len(ids)} 条，"
@@ -96,7 +116,7 @@ class StoryboardStage(BaseStage):
         return context
 
     async def _fetch_asset_cache(self, context: PipelineContext, chapter_scenes: list) -> dict:
-        """从飞书素材表并发查询本章实体的 image_url（I2V 备用）。"""
+        """从飞书素材表并发查询本章实体资产（I2V 备用）。"""
         chapter_entity_ids = set()
         for sc in chapter_scenes:
             for eid in (sc.get("entity_ids") or []):
@@ -110,17 +130,16 @@ class StoryboardStage(BaseStage):
             a = await asyncio.to_thread(
                 self.bitable.get_asset_by_entity, eid, context.novel_id
             )
-            url = a.get("image_url", "") if a.get("found") else ""
-            return eid, url
+            return eid, a if a.get("found") else None
 
         results = await asyncio.gather(
             *[_fetch_one(eid) for eid in chapter_entity_ids],
             return_exceptions=True,
         )
         return {
-            eid: url
-            for eid, url in results
-            if not isinstance((eid, url), Exception) and isinstance(url, str) and url
+            eid: a
+            for eid, a in results
+            if not isinstance((eid, a), Exception) and a
         }
 
     async def _run_chapter(
